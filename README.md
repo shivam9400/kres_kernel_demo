@@ -5,6 +5,8 @@ repository packages an unchanged, pinned KRes source snapshot and reproducible
 scripts for reviewing public Linux v6.12 source.
 
 Read [setup.md](setup.md) for installation, validation, commands and limitations.
+Read [how_to_use.md](how_to_use.md) for reviews and configurable Codex/Gemini CLI
+selection. See the [workflow architecture diagram](docs/architecture.md).
 Read [docs/kernel-engineering.md](docs/kernel-engineering.md) for practical uses
 in a Samsung kernel engineering workflow.
 

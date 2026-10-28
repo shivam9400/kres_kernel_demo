@@ -102,8 +102,9 @@ Run artifacts under `results/review-*/` include findings and session state.
 Inspect actual logs and statuses before treating a run as completed. Model
 findings are hypotheses until validated against source and tests.
 
-For another authorized model, update the local generated provider's model entry
-and the four role selectors in `scripts/review.sh` together. Do not assume every
+For another authorized model, edit `config/llm.json`, or pass a separate local
+config using `--config`. See [how_to_use.md](how_to_use.md) for Gemini CLI
+selection and limitations. Do not assume every
 account supports the upstream example model. For an API provider follow the
 pinned upstream [configuration reference](vendor/kres/docs/configuration.md).
 

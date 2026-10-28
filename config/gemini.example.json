@@ -1,0 +1,7 @@
+{
+  "provider": "gemini-cli",
+  "model": "gemini-2.5-pro",
+  "gemini_cli": "gemini",
+  "timeout_seconds": 300,
+  "max_parallel": 2
+}

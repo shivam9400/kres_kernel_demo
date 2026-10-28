@@ -1,0 +1,7 @@
+{
+  "provider": "codex",
+  "model": "gpt-5.6-sol",
+  "gemini_cli": "gemini",
+  "timeout_seconds": 300,
+  "max_parallel": 2
+}

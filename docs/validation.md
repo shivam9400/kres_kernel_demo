@@ -44,3 +44,16 @@ The local tool build and source workspace are prepared. A working end-to-end
 LLM review remains blocked on the network prerequisite and subsequent provider
 validation. Do not treat an empty findings file from an interrupted run as a
 clean review.
+
+## Configurable Gemini CLI adapter
+
+Two adapter tests passed using the real compiled KRes binary and a deterministic
+fake Gemini executable: chat transport to CLI/stdin/JSON and rejection of an
+unauthenticated loopback request. Run `python3 tests/test_gemini_bridge.py`.
+The cloud command sandbox denies socket creation, so this test requires an
+execution context permitting loopback listeners. KRes's explicit `proxy: ""`
+is used only for its loopback bridge; the Gemini subprocess retains outbound
+proxy and CA settings. No native KRes source was changed.
+
+Gemini CLI was not installed and no company credentials or real Gemini inference
+were tested. End-to-end kernel findings from Gemini remain unverified.
