@@ -1,0 +1,104 @@
+Consolidate N sibling slow-agent lens outputs for ONE task into a
+unified analysis narrative and a deduplicated findings list. See
+findings-json-format.md for the per-Finding schema.
+
+The input 'lens_outputs' is a list of {lens: {type, name, id, reason},
+slow_model: str, analysis: str, findings: [Finding, ...], followups: [Followup, ...]}.
+'task_brief' names the todo item this task was started for.
+
+Return raw, unfenced JSON only—no Markdown backticks and no preamble:
+{"analysis": "unified prose narrative", "findings": [<Finding>, ...], "followups": [<Followup>, ...], "comparison": {"summary": "...", "per_model": [{"slow_model": "...", "quality": "...", "depth": "...", "unique_contributions": ["..."], "weaknesses": ["..."]}], "selection_notes": ["..."]}}
+
+MODEL COMPARISON:
+- When multiple slow_model values are present for the same lens,
+  compare those sibling outputs for quality and depth before merging.
+- Prefer the output that gives the most concrete trigger path,
+  code-backed evidence, and complete Finding records. Preserve unique
+  useful evidence or followups from weaker siblings instead of dropping
+  it solely because the overall output was weaker.
+- Attribute useful contributions by slow_model in comparison.per_model.
+  Keep this concise but specific enough to explain which models found
+  deeper bugs, which were shallow, and which evidence was selected.
+
+DEDUP ACROSS LENSES:
+- If multiple lens outputs emit findings describing the same bug
+  (overlapping relevant_symbols / relevant_file_sections / impact),
+  MERGE into a single Finding. Extend summary with detail from each
+  lens, union relevant_symbols and relevant_file_sections (dedup by
+  filename+line), union related_finding_ids, union open_questions.
+  Carry through any resolved_questions the lenses emitted; a question
+  one lens settled is settled for the merged finding.
+  Preserve mechanism_detail and fix_sketch from whichever lens
+  captured them (concatenate with '; ' if both did and they're
+  distinct; otherwise keep the more specific one).
+- Keep the most specific id. If ids disagree, pick the one that
+  best describes the symptom + primary symbol.
+- Preserve severity — use the HIGHEST severity when lenses disagree.
+- If a lens's prose contains '[FLAG → <other-lens>]' but another
+  lens actually emitted a full Finding for that same bug, drop the
+  flag (it was the sibling's job) and keep the full Finding.
+
+COMPLETENESS CHECK — promote prose-only bugs:
+- Before returning, scan every per-lens 'analysis' for bugs that the
+  lens described but NEVER emitted as a Finding. Typical symptoms:
+  a paragraph naming a UAF / race / leak / missing guard in specific
+  code, but no matching id in that lens's findings array OR in the
+  other lenses' arrays.
+- Promote each such bug to a NEW Finding in the unified list. Pull
+  relevant_symbols from whichever lens's prose described it (the
+  symbol bodies are available in 'symbols' / 'context' upstream; the
+  per-lens analyses already quoted them inline — copy those). Fill
+  summary / reproducer_sketch / impact from the prose. Mark severity
+  conservatively. If the prose is too thin to support a Finding (no
+  concrete code path + trigger), leave it in the prose only and do
+  NOT fabricate.
+- Rationale: the merge pass downstream reads ONLY the findings
+  array. Prose-only bugs are lost forever after this step. Promote
+  or demote — never silently drop.
+
+FRONTIER CHECK — preserve unresolved concrete work:
+- Union the input followups and keep only concrete typed requests
+  that would fetch source/types, callers, history, grep results, or a
+  narrow question needed to prove or disprove a suspicion.
+- Treat unsupported negative coverage claims as unresolved work.
+  If a lens says "no remaining users", "all callers updated", "old
+  path unreachable", "only reader", "only writer", or equivalent
+  without citing concrete source, type, search, caller/callee, or history
+  evidence, add a followup for the missing proof instead of carrying
+  that claim into a clean conclusion.
+- If a lens analysis describes a concrete unresolved suspicion
+  tied to a code path but did not emit a Finding or followup, add a
+  followup for the exact missing evidence. Use the narrowest useful
+  request: source:<symbol>, type:<type>, callers:<symbol>,
+  read:<file:line+count>, git:<readonly command>,
+  grep/search:<pattern>, or question:<specific blocker>.
+- Do not add followups for vague design concerns, generic "more
+  review", or areas explicitly disproved by cited evidence.
+- A clean consolidated review has no findings and no followups only
+  when all concrete suspicions raised by the lenses were resolved.
+
+UNIFIED ANALYSIS — prose for the human reader:
+- ONE prose narrative covering the task as a whole, not a
+  concatenation of per-lens sections. Reference Findings by id.
+- Keep observations that didn't rise to actionable-bug status
+  (invariants verified, dead-ends explored, design notes) — those
+  are context for future tasks.
+- Every code reference in this prose MUST be an inline snippet
+  (3-8 lines of actual code), NOT a bare 'filename:line' citation.
+  Format:
+      filename.c:function_name() {
+          ... salient code ...
+      }
+  Pull snippets from the per-lens analyses or from the findings'
+  relevant_symbols / relevant_file_sections. Don't paste entire
+  function bodies — the findings array has those; use the smallest
+  block that makes the point.
+- The Finding records themselves keep their structured schema
+  unchanged (summary / reproducer_sketch / impact with
+  'filename:line' citations plus embedded relevant_symbols). The
+  inline-snippets rule is for the prose analysis ONLY.
+
+Return exactly one raw JSON object with analysis, findings, followups, and comparison.
+Do not return Markdown: no Markdown headings, prose preamble, code fences,
+backticks, or trailing commentary. comparison.selection_notes must remain inside
+the comparison object; never emit selection_notes as a top-level field.

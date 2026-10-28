@@ -1,0 +1,9960 @@
+//! Workflow executor — walks a [`Workflow`] step by step, calls a
+//! [`Driver`] for each, evaluates `eval.expr`, and dispatches the
+//! `on_fail` action (repeat / rerun_chain / branch_to / continue /
+//! exit_failure). No LLM call here: tests inject a [`ScriptedDriver`]
+//! that returns pre-baked outputs keyed by `(step_id, attempt)`, so
+//! we can watch the iteration logic land each branch (step repeats,
+//! review failures branch back to patch writing, build triage
+//! exhausts, etc.).
+//!
+//! The executor is workflow-driven, not LLM-driven: it does not
+//! interpolate variables into prompt strings or directly call out to the
+//! network. Those concerns belong to the production driver. What this module exists to do is
+//! exercise the **control-flow** semantics encoded in the workflow
+//! schema, so that authoring fix.json (or any future workflow) is
+//! testable without standing up the agent pipeline.
+//!
+//! ## Expression language
+//!
+//! [`expr::eval`] evaluates the `run_if` / `skip_if` / `eval.expr`
+//! grammar pinned by the workflow `$format` block:
+//!
+//! ```text
+//! expr   := or
+//! or     := and ('||' and)*
+//! and    := cmp ('&&' cmp)*
+//! cmp    := '(' or ')' | path op rhs
+//! op     := '==' | '!=' | '<' | '<=' | '>' | '>='
+//! rhs    := path | string | int | bool
+//! path   := ident ('.' ident)*
+//! ```
+//!
+//! A bare path inside an `eval.expr` resolves against the current
+//! step's outputs (`commit_sha != ''` is shorthand for `<current
+//! step>.commit_sha != ''`). Dotted paths that start with a known step
+//! id name that explicit step (`write-patch.attempt`); otherwise they
+//! may walk an object emitted by the current step
+//! (`result.code == 0`). `workflow.<input-or-derived-field>` names
+//! workflow input.
+//!
+//! The two synthetic per-step fields documented in fix.json's
+//! `$format.counters` (`{step}.attempt` and `{step}.eval_failures`)
+//! are exposed by the resolver alongside whatever outputs the driver
+//! has produced.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde_json::{Map, Value};
+
+use crate::workflow::{Agent, Aggregate, Lens, OnExhausted, OnFailAction, Step, Workflow};
+
+/// Synthetic workflow step holding the fix loop's objectives across
+/// review cycles. It is not schedulable, but prompt interpolation can
+/// reference `{{objectives.list}}` exactly like any other step output,
+/// and snapshots persist it with the real steps.
+///
+/// This is the loop's ONLY cross-round memory. Every real step is
+/// reset by `reset_dependents_preserving` when the orchestrator routes
+/// backwards, which takes its outputs into `prior_attempts` and clears
+/// them; a synthetic step is in no workflow's `depends_on`, so nothing
+/// resets it.
+///
+/// It is written by the step that declares an `objectives` output --
+/// the reconciliation pass -- and by nothing else. It previously had a
+/// separate fast-agent writer, which never once ran: entries could
+/// only be born from review defects, but the review's `clean == true`
+/// eval fails on exactly the rounds that have defects, and the writer
+/// was only reached on eval PASS. Measured across three fix runs
+/// including one that succeeded, `phase=review-ledger` appears zero
+/// times, so every prompt referencing the ledger had been rendering
+/// empty since it was added.
+pub const OBJECTIVES_STEP_ID: &str = "objectives";
+
+/// How many review cycles an objective may stay open before the
+/// reconciliation pass must make it the loop's `must_fix`, satisfy it,
+/// or withdraw it. Two, because the stall in the 2026-08-10 linux.nfs
+/// run was already visible at round three.
+pub const OBJECTIVE_STALE_ROUNDS: u64 = 2;
+
+/// Snapshot of one step's runtime state. Carries the everything
+/// needed to resume from disk: status, attempt counter, eval
+/// failures, and last produced outputs.
+///
+/// `StepState::default()` produces the natural pre-run state:
+/// `attempt=0`, `status=Pending`, every collection empty. Any
+/// construction site that needs a different starting attempt
+/// (resume-from-disk replays, scripted test fixtures, the review
+/// ledger sentinel) must set the field explicitly — keep the
+/// `..StepState::default()` rest-pattern for collections only.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct StepState {
+    pub id: String,
+    pub status: StepStatus,
+    pub attempt: u32,
+    pub eval_failures: u32,
+    /// Why the previous attempt's eval rejected this step, if it did.
+    ///
+    /// Fed back into the next attempt's prompt. Without it a retry was
+    /// told only `attempt: 2` and had to guess what to change: on the
+    /// 2026-08-08 batch eight runs burned all three attempts repeating
+    /// one omission the eval had named precisely each time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_eval_reason: Option<String>,
+    pub outputs: Map<String, Value>,
+    /// Exact driver effect payload accepted for this attempt. Present only
+    /// while `status == EffectsPending`; persisted so resume replays the
+    /// accepted effect instead of regenerating model output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_effects: Option<Value>,
+    /// Outputs from the last settled run that should survive a
+    /// future skip. Kept separate from `outputs` while the step is
+    /// Pending so downstream expressions cannot observe stale data
+    /// before the skip condition is actually evaluated.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub preserved_outputs_on_skip: Map<String, Value>,
+    /// Partial per-lens outputs for a lensed step. Filled
+    /// incrementally as each lens settles in the per-lens loop;
+    /// cleared when the step's aggregator runs and `outputs` is
+    /// populated. Persisted so a resume mid-fan-out doesn't re-run
+    /// already-completed lenses (Fix #10). Empty for non-lensed
+    /// steps.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub lens_outputs: Map<String, Value>,
+    /// Outputs from prior attempts of this same step, oldest first.
+    /// Populated when an eval-fail OnFailAction::Repeat retries the
+    /// step: the current outputs are pushed here before the next
+    /// attempt overwrites them. Surfaced to the next attempt's
+    /// prompt via the `{{<step>.prior_attempts}}` interpolation so
+    /// the slow agent can see what it proposed previously and
+    /// either commit to that shape or justify a change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_attempts: Vec<Map<String, Value>>,
+    /// True only while `on_fail: repeat` is re-running the same
+    /// semantic attempt against an unchanged workspace. Drivers may
+    /// reuse this step's gathered source in that case. Branch and
+    /// rerun-chain re-entry explicitly clear it because intervening
+    /// steps may have changed the source tree.
+    #[serde(default)]
+    pub reuse_gathered_context: bool,
+}
+
+/// Walk a dotted path through a JSON value. Stops at the first
+/// segment that `Value::get` cannot resolve and returns that
+/// segment as the `Err`; callers map it into their preferred error
+/// type (anyhow in the interpolation engine, `String` in the
+/// expression evaluator) so the loop body lives once. `rest` is
+/// the suffix of path segments after whatever lookup the caller
+/// already performed (e.g. `parts[2..]` once the step id and first
+/// segment have been consumed). The returned `&str` borrows from
+/// `rest`, so callers materialise it via `to_string` / `format!`
+/// before the borrow ends.
+pub fn walk_dotted_path<S: AsRef<str>>(start: Value, rest: &[S]) -> Result<Value, &str> {
+    let mut cur = start;
+    for p in rest {
+        let key = p.as_ref();
+        cur = cur.get(key).cloned().ok_or(key)?;
+    }
+    Ok(cur)
+}
+
+impl StepState {
+    /// Render `prior_attempts` as a `serde_json::Value` for use by
+    /// the interpolation engines (`{{<step>.prior_attempts}}`).
+    /// Returns every recorded field from every attempt. Workflow history is
+    /// never shortened to fit a request.
+    pub fn prior_attempts_value(&self) -> Value {
+        serde_json::to_value(&self.prior_attempts)
+            .expect("Vec<Map<String, Value>> serialize is infallible")
+    }
+
+    /// Single lookup for a `{{<step>.<name>}}` or bare `{{<name>}}`
+    /// reference. Returns the value for interpolation-only fields
+    /// stored directly on `StepState` (`attempt`, `eval_failures`,
+    /// `prior_attempts`), falling back to declared `outputs`. Both
+    /// resolvers in this crate (`workflow_exec::resolve`,
+    /// `workflow_runner::resolve_one`) consult this to keep the
+    /// reserved-name list and StepState-field projection in one
+    /// place; see [`RESERVED_STEP_OUTPUT_NAMES`] in
+    /// `workflow.rs:580` for the matching parse-time guard.
+    pub fn lookup_field(&self, name: &str) -> Option<Value> {
+        match name {
+            "attempt" => Some(Value::Number(self.attempt.into())),
+            "eval_failures" => Some(Value::Number(self.eval_failures.into())),
+            "prior_attempts" => Some(self.prior_attempts_value()),
+            _ => self.outputs.get(name).cloned(),
+        }
+    }
+}
+
+/// On-disk snapshot of a workflow run — enough to resume from
+/// where it left off. Written atomically (tmp + rename) every time
+/// a step settles, plus on Trace::status changes. The snapshot is
+/// addressable by `workflow.id`; multiple in-flight workflows can
+/// coexist in the same dir.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSnapshot {
+    pub schema_version: u32,
+    pub workflow_id: String,
+    pub inputs: Map<String, Value>,
+    pub steps: Vec<StepState>,
+    pub events_count: usize,
+}
+
+impl WorkflowSnapshot {
+    /// Current snapshot schema version. Bump when the on-disk shape
+    /// changes in a way that would crash old loaders.
+    pub const SCHEMA_VERSION: u32 = 3;
+
+    /// Latest persisted snapshot for the given workflow id. Returns
+    /// None when the file is missing OR carries a `schema_version`
+    /// this binary doesn't understand — better to start clean than
+    /// to deserialise into a struct shape that has since changed.
+    pub fn load(dir: &std::path::Path, workflow_id: &str) -> Option<Self> {
+        let p = dir.join(format!("workflow-{workflow_id}.json"));
+        let body = std::fs::read_to_string(&p).ok()?;
+        // Peek at the version BEFORE attempting full deserialisation
+        // — if it's a future version, we want a clear "skip" rather
+        // than a confusing parse error from a renamed field.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+            let ver = v
+                .get("schema_version")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            if ver as u32 != Self::SCHEMA_VERSION {
+                tracing::warn!(
+                    target: "kres_agents::workflow_exec",
+                    "snapshot {} has schema_version {ver}; this binary expects {} — ignoring",
+                    p.display(),
+                    Self::SCHEMA_VERSION,
+                );
+                return None;
+            }
+        }
+        serde_json::from_str(&body).ok()
+    }
+
+    /// Atomically write to `<dir>/workflow-<id>.json` (tmp + rename).
+    pub fn save(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+
+        std::fs::create_dir_all(dir)?;
+        let target = dir.join(format!("workflow-{}.json", self.workflow_id));
+        // The scratch name carries the pid. Without it two concurrent
+        // runs of the same workflow id pointed at one directory write
+        // the same `.tmp`, and the second rename fails with ENOENT
+        // because the first already renamed that path away. Observed on
+        // a 50-way parallel /validate batch, which shares the fallback
+        // state directory: two runs died with "persist workflow effect
+        // boundary: No such file or directory".
+        //
+        // This makes the write atomic per process. It does NOT make a
+        // shared target safe -- see the per-run fallback directory in
+        // kres-repl::workflow.
+        let tmp = dir.join(format!(
+            "workflow-{}.json.{}.{}.tmp",
+            self.workflow_id,
+            std::process::id(),
+            SNAPSHOT_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let body = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(tmp, target)?;
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    }
+}
+
+/// Serial number for snapshot scratch files, so no two `save()` calls in
+/// one process can pick the same temporary path.
+static SNAPSHOT_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepStatus {
+    /// Hasn't run yet, or has been reset for a re-entry.
+    #[default]
+    Pending,
+    /// Eval and ledger processing succeeded and the exact effect payload is
+    /// durable, but effect application has not yet been durably completed.
+    EffectsPending,
+    /// `run_if` was false (or `skip_if` true).
+    Skipped,
+    /// Eval passed, or no eval configured and the step settled.
+    Done,
+    /// Eval exhausted with `on_exhausted: continue` — kept on the
+    /// graph so dependents can still progress.
+    DoneWithFailure,
+    /// `branch_to` jumped away from this step before it settled.
+    BranchedAway,
+    /// The step terminally failed or exhausted its retry budget.
+    /// Persisted so resume cannot silently grant another attempt.
+    TerminalFailure,
+}
+
+pub enum LensFanOutConsolidate {
+    Unsupported,
+    Outputs(Map<String, Value>),
+}
+
+/// A driver returns the outputs a step would emit. Tests script
+/// outcomes by `(step_id, attempt)`; production drivers (see
+/// [`crate::workflow_runner::LlmDriver`]) call the kres-llm client.
+///
+/// Async because real drivers do network I/O. Returning `Err`
+/// terminates the workflow with [`WorkflowStatus::Failure`] — the
+/// LLM client itself handles transient retries (HTTP 429,
+/// transport blips) before giving up, so an error here means the
+/// driver has decided the step cannot be retried within this run.
+/// Typed error from [`Driver::run`]. Lets the exec loop tell apart
+/// "provider rejected the input as over the per-request token
+/// limit" from every other failure. The executor never responds by deleting
+/// model input.
+#[derive(Debug, thiserror::Error)]
+pub enum DriverError {
+    /// Provider returned an over-input-limit rejection. The exec
+    /// loop preserves the complete request and reports the failure.
+    #[error("OverInputLimit step={step} actual={actual} limit={limit}")]
+    OverInputLimit {
+        step: String,
+        actual: u64,
+        limit: u64,
+    },
+    /// Anything else the driver wants to report. The exec loop
+    /// folds this into a `"driver error: ..."` failure message
+    /// and routes it through `retry_driver_error`.
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for DriverError {
+    fn from(s: String) -> Self {
+        DriverError::Other(s)
+    }
+}
+
+impl From<&str> for DriverError {
+    fn from(s: &str) -> Self {
+        DriverError::Other(s.to_string())
+    }
+}
+
+#[async_trait]
+pub trait Driver: Sync {
+    /// Begin one workflow executor invocation. Drivers with ephemeral
+    /// per-run caches should clear them here so reused driver instances
+    /// cannot leak state across workflows, fix todos, or plan revisions.
+    fn begin_run(&self) {}
+
+    /// Run one step instance. `lens` is `Some` for one of N parallel
+    /// calls when the step has a `lenses` fan-out; `None` for plain
+    /// steps. The driver should bind `{{lens.<field>}}` from the
+    /// passed-in lens in any prompt it builds.
+    async fn run(
+        &self,
+        step: &Step,
+        attempt: u32,
+        ctx: &ExecContext<'_>,
+        lens: Option<&Lens>,
+    ) -> Result<Map<String, Value>, DriverError>;
+
+    /// Return the exact, serializable side effects staged by `run`. The
+    /// executor persists this value before allowing the driver to apply it.
+    async fn attempt_effects(
+        &self,
+        _step: &Step,
+        _attempt: u32,
+        _ctx: &ExecContext<'_>,
+    ) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+
+    /// Apply a previously persisted effect payload. Implementations must be
+    /// idempotent because resume may replay an effect whose first application
+    /// completed immediately before cancellation.
+    async fn apply_attempt_effects(
+        &self,
+        step: &Step,
+        attempt: u32,
+        _effects: &Value,
+        ctx: &ExecContext<'_>,
+    ) -> Result<Map<String, Value>, String> {
+        if matches!(step.agent, Some(Agent::Reaper)) {
+            self.run(step, attempt, ctx, None)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            Ok(Map::new())
+        }
+    }
+
+    /// Drop process-local side effects staged by a rejected attempt.
+    async fn discard_attempt(&self, _step: &Step, _attempt: u32) {}
+
+    /// Run an N+1 consolidate call for a lensed step whose
+    /// `aggregate` is `Consolidate`. `per_lens` is the list of
+    /// `(lens_id, outputs)` from the fan-out. The implementation
+    /// is expected to send these to an LLM with the step's
+    /// `consolidate.prompt` plus an OUTPUT SCHEMA tail and parse
+    /// the response into the step's declared outputs.
+    ///
+    /// Default impl errors so a workflow that asks for
+    /// `aggregate: consolidate` against a driver that doesn't
+    /// implement it fails loudly instead of silently dropping
+    /// findings.
+    async fn consolidate(
+        &self,
+        _step: &Step,
+        _ctx: &ExecContext<'_>,
+        _per_lens: &[(String, Map<String, Value>)],
+    ) -> Result<Map<String, Value>, DriverError> {
+        Err(
+            "driver does not implement consolidate; use aggregate=concat or supply an LlmDriver"
+                .into(),
+        )
+    }
+
+    /// Run an LLM-judged eval. The driver builds a prompt with the
+    /// step's outputs as JSON + the step's `eval.judge_prompt`, asks
+    /// for `{pass: bool, reason: string}`. Returns `(pass, reason)`.
+    /// Default impl errors so a workflow asking for `judge_llm`
+    /// eval against a non-LLM driver fails loudly.
+    async fn judge(&self, _step: &Step, _ctx: &ExecContext<'_>) -> Result<(bool, String), String> {
+        Err(
+            "driver does not implement judge; use eval.type=field_check or supply an LlmDriver"
+                .into(),
+        )
+    }
+
+    /// Optimised dispatch for a lensed step whose `aggregate` is
+    /// `Consolidate`. `Ok(Unsupported)` means the driver has no
+    /// shared-gather implementation and the executor should use the
+    /// regular per-lens path. `Err` means the shared-gather path ran
+    /// and failed; the executor must spend the step retry budget
+    /// rather than silently repeating work through another engine.
+    async fn lens_fan_out_consolidate(
+        &self,
+        _step: &Step,
+        _attempt: u32,
+        _ctx: &ExecContext<'_>,
+    ) -> Result<LensFanOutConsolidate, String> {
+        Ok(LensFanOutConsolidate::Unsupported)
+    }
+}
+
+/// Fold a reconciliation pass's emitted objectives into the
+/// persistent store, stamping the round each was first raised.
+///
+/// Rust owns the round numbers for the same reason it owns the todo
+/// list: age is the forward-progress signal, and a model that
+/// restated its own objective's age could always report it as new.
+///
+/// Omission is not deletion. An objective the pass did not re-emit is
+/// carried forward unchanged, so a stale one cannot be retired by
+/// going quiet about it -- it has to be satisfied or withdrawn.
+fn merge_emitted_objectives(state: &mut HashMap<String, StepState>, outputs: &Map<String, Value>) {
+    let emitted = outputs
+        .get("objectives")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let store = state
+        .entry(OBJECTIVES_STEP_ID.to_string())
+        .or_insert_with(empty_objectives_state);
+    let round = store
+        .outputs
+        .get("round")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut merged: Vec<Value> = store
+        .outputs
+        .get("list")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    for item in emitted {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let existing = merged
+            .iter_mut()
+            .find(|held| held.get("id").and_then(Value::as_str) == Some(id));
+        match existing {
+            Some(held) => {
+                let first = held
+                    .get("first_round")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(round);
+                let mut updated = item.clone();
+                if let Some(obj) = updated.as_object_mut() {
+                    obj.insert("first_round".into(), Value::from(first));
+                    obj.insert("rounds_open".into(), Value::from(round - first + 1));
+                }
+                *held = updated;
+            }
+            None => {
+                let mut fresh = item.clone();
+                if let Some(obj) = fresh.as_object_mut() {
+                    obj.insert("first_round".into(), Value::from(round));
+                    obj.insert("rounds_open".into(), Value::from(1u64));
+                }
+                merged.push(fresh);
+            }
+        }
+    }
+
+    store.outputs.insert("round".into(), Value::from(round));
+    store.outputs.insert("list".into(), Value::Array(merged));
+
+    // The steering fields ride the store for the same reason the
+    // objectives do: they have to survive the cascade that carries
+    // them to the workers.
+    //
+    // `reset_dependents_preserving` preserves the outputs of the
+    // BRANCHING step only, which is why `orchestrator.instruction`
+    // reaches a worker and `reconcile-review.instructions` does not --
+    // the reconciliation pass is a transitive dependent of write-patch
+    // (write-patch -> commit -> build -> review -> reconcile-review),
+    // so branching back to write-patch takes its outputs into
+    // `prior_attempts` and clears them. Measured on the 2026-08-10
+    // linux.nfs run: all eight write-patch prompts rendered the
+    // reconciled instruction block with an empty array.
+    for key in [
+        "instructions",
+        "contradictions",
+        "dropped",
+        "must_fix",
+        "scope_amendment",
+    ] {
+        match outputs.get(key) {
+            Some(value) => {
+                store.outputs.insert(key.to_string(), value.clone());
+            }
+            None => {
+                store.outputs.remove(key);
+            }
+        }
+    }
+    store.status = StepStatus::Done;
+}
+
+/// True when this step owns the objectives store, i.e. it declares an
+/// `objectives` output. Data-driven so the executor does not need to
+/// know which workflow step is the reconciliation pass.
+fn step_owns_objectives(step: &Step) -> bool {
+    step.outputs.contains_key("objectives")
+}
+
+/// Read-only view exposed to `Driver::run`. Has the workflow inputs
+/// and every step's current state so a driver can decide what to
+/// emit based on prior outputs.
+pub struct ExecContext<'a> {
+    pub workflow_inputs: &'a Map<String, Value>,
+    pub steps: &'a HashMap<String, StepState>,
+}
+
+pub fn active_lenses<'a>(step: &'a Step, ctx: &ExecContext<'_>) -> Result<Vec<&'a Lens>, String> {
+    step.lenses
+        .iter()
+        .filter_map(|lens| match lens_is_active(lens, ctx, Some(&step.id)) {
+            Ok(true) => Some(Ok(lens)),
+            Ok(false) => None,
+            Err(e) => Some(Err(format!("lens '{}' condition: {e}", lens.id))),
+        })
+        .collect()
+}
+
+fn lens_is_active(
+    lens: &Lens,
+    ctx: &ExecContext<'_>,
+    current_step: Option<&str>,
+) -> Result<bool, String> {
+    if let Some(expr) = lens.run_if.as_deref() {
+        if !expr::eval(expr, ctx, current_step)? {
+            return Ok(false);
+        }
+    }
+    if let Some(expr) = lens.skip_if.as_deref() {
+        if expr::eval(expr, ctx, current_step)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Final disposition of a workflow run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowStatus {
+    /// All steps settled, no terminal short-circuit, no exit_failure.
+    Success,
+    /// A step with `terminal_on_success: true` settled — the
+    /// workflow ends there and downstream steps don't run.
+    TerminalSuccess(String),
+    /// Exit triggered by `on_fail.action: exit_failure` or by an
+    /// `on_exhausted: exit_failure` after max_attempts.
+    Failure(String),
+    /// The executor's own iteration cap fired. Indicates a workflow
+    /// that loops forever — almost always an authoring bug.
+    IterationCap(usize),
+}
+
+/// Trace event — the executor emits one or more of these per step
+/// iteration so tests can assert on the path the run actually took.
+#[derive(Debug, Clone)]
+pub enum TraceEvent {
+    StepStarted {
+        id: String,
+        attempt: u32,
+    },
+    StepSkipped {
+        id: String,
+        reason: String,
+    },
+    StepProduced {
+        id: String,
+        attempt: u32,
+        outputs: Map<String, Value>,
+    },
+    EvalPassed {
+        id: String,
+        attempt: u32,
+    },
+    EvalFailed {
+        id: String,
+        attempt: u32,
+        action: String,
+        eval_failures: u32,
+    },
+    BranchedTo {
+        from: String,
+        to: String,
+    },
+    RerunChain {
+        from: String,
+        ids: Vec<String>,
+    },
+    Exhausted {
+        id: String,
+        on_exhausted: String,
+        attempts: u32,
+    },
+    /// A lensed step is about to fan out N concurrent driver calls.
+    FanOut {
+        id: String,
+        attempt: u32,
+        lens_ids: Vec<String>,
+    },
+    /// One lens of a fan-out completed (or errored) and produced
+    /// outputs. Order is completion order, not lens-array order.
+    LensProduced {
+        id: String,
+        attempt: u32,
+        lens_id: String,
+        outputs: Map<String, Value>,
+    },
+    /// All lenses settled; an N+1 consolidate LLM call is about
+    /// to run with the per-lens outputs. Only emitted when the
+    /// step's aggregate strategy is `consolidate`.
+    Consolidating {
+        id: String,
+        attempt: u32,
+        lens_count: usize,
+    },
+    /// All lenses settled; outputs aggregated per the step's
+    /// `aggregate` strategy. The aggregated map is what the
+    /// step's eval and downstream interpolation see.
+    FanIn {
+        id: String,
+        attempt: u32,
+        aggregated: Map<String, Value>,
+        strategy: String,
+    },
+    Terminated {
+        status: WorkflowStatus,
+    },
+}
+
+/// Trace of a workflow run.
+pub struct Trace {
+    pub events: Vec<TraceEvent>,
+    pub status: WorkflowStatus,
+    pub final_state: HashMap<String, StepState>,
+}
+
+/// One-line pretty-print of a single TraceEvent. Same formatting
+/// rules as `Trace::pretty()` but exposed for streaming consumers
+/// (the REPL's async_println, a TUI). Trailing newline is included.
+pub fn format_event(ev: &TraceEvent) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    match ev {
+        TraceEvent::StepStarted { id, attempt } => {
+            let _ = writeln!(out, "→ start  {id} (attempt {attempt})");
+        }
+        TraceEvent::StepSkipped { id, reason } => {
+            let _ = writeln!(out, "· skip   {id} — {reason}");
+        }
+        TraceEvent::StepProduced {
+            id,
+            attempt,
+            outputs,
+        } => {
+            let kv = format_output_map(outputs);
+            let _ = writeln!(out, "✓ produced {id} (attempt {attempt}) — {{{kv}}}");
+            append_output_details(&mut out, outputs, 900);
+        }
+        TraceEvent::EvalPassed { id, attempt } => {
+            let _ = writeln!(out, "✓ eval ok {id} (attempt {attempt})");
+        }
+        TraceEvent::EvalFailed {
+            id,
+            attempt,
+            action,
+            eval_failures,
+        } => {
+            let _ = writeln!(
+                out,
+                "✗ eval fail {id} (attempt {attempt}, total fails {eval_failures}) → {action}"
+            );
+        }
+        TraceEvent::BranchedTo { from, to } => {
+            let _ = writeln!(out, "⇢ branch {from} → {to}");
+        }
+        TraceEvent::RerunChain { from, ids } => {
+            let _ = writeln!(out, "↻ rerun  {from} → {}", ids.join(","));
+        }
+        TraceEvent::Exhausted {
+            id,
+            on_exhausted,
+            attempts,
+        } => {
+            let _ = writeln!(
+                out,
+                "! exhausted {id} after {attempts} attempts → {on_exhausted}"
+            );
+        }
+        TraceEvent::FanOut {
+            id,
+            attempt,
+            lens_ids,
+        } => {
+            let _ = writeln!(
+                out,
+                "⇉ fan-out {id} (attempt {attempt}) → {}",
+                lens_ids.join(",")
+            );
+        }
+        TraceEvent::LensProduced {
+            id,
+            attempt,
+            lens_id,
+            outputs,
+        } => {
+            let kv = format_output_map(outputs);
+            let _ = writeln!(
+                out,
+                "  · lens {lens_id}@{id} (attempt {attempt}) — {{{kv}}}"
+            );
+            append_output_details(&mut out, outputs, 350);
+        }
+        TraceEvent::Consolidating {
+            id,
+            attempt,
+            lens_count,
+        } => {
+            let _ = writeln!(
+                out,
+                "⊕ consolidate {id} (attempt {attempt}, {lens_count} lens outputs)"
+            );
+        }
+        TraceEvent::FanIn {
+            id,
+            attempt,
+            aggregated,
+            strategy,
+        } => {
+            let kv = format_output_map(aggregated);
+            let _ = writeln!(
+                out,
+                "⇇ fan-in  {id} (attempt {attempt}, {strategy}) — {{{kv}}}"
+            );
+        }
+        TraceEvent::Terminated { status } => {
+            let _ = writeln!(out, "□ terminated: {:?}", status);
+        }
+    }
+    out
+}
+
+impl Trace {
+    /// Pretty single-line-per-event dump. Use with
+    /// `cargo test -- --nocapture` to watch the iteration land.
+    pub fn pretty(&self) -> String {
+        let mut out = String::new();
+        for ev in &self.events {
+            match ev {
+                TraceEvent::StepStarted { id, attempt } => {
+                    out.push_str(&format!("→ start  {id} (attempt {attempt})\n"));
+                }
+                TraceEvent::StepSkipped { id, reason } => {
+                    out.push_str(&format!("· skip   {id} — {reason}\n"));
+                }
+                TraceEvent::StepProduced {
+                    id,
+                    attempt,
+                    outputs,
+                } => {
+                    let kv = format_output_map(outputs);
+                    out.push_str(&format!("✓ produced {id} (attempt {attempt}) — {{{kv}}}\n"));
+                    append_output_details(&mut out, outputs, 900);
+                }
+                TraceEvent::EvalPassed { id, attempt } => {
+                    out.push_str(&format!("✓ eval ok {id} (attempt {attempt})\n"));
+                }
+                TraceEvent::EvalFailed {
+                    id,
+                    attempt,
+                    action,
+                    eval_failures,
+                } => {
+                    out.push_str(&format!(
+                        "✗ eval fail {id} (attempt {attempt}, total fails {eval_failures}) → {action}\n"
+                    ));
+                }
+                TraceEvent::BranchedTo { from, to } => {
+                    out.push_str(&format!("⇢ branch {from} → {to}\n"));
+                }
+                TraceEvent::RerunChain { from, ids } => {
+                    out.push_str(&format!("↻ rerun  {from} → {}\n", ids.join(",")));
+                }
+                TraceEvent::Exhausted {
+                    id,
+                    on_exhausted,
+                    attempts,
+                } => {
+                    out.push_str(&format!(
+                        "! exhausted {id} after {attempts} attempts → {on_exhausted}\n"
+                    ));
+                }
+                TraceEvent::FanOut {
+                    id,
+                    attempt,
+                    lens_ids,
+                } => {
+                    out.push_str(&format!(
+                        "⇉ fan-out {id} (attempt {attempt}) → {}\n",
+                        lens_ids.join(",")
+                    ));
+                }
+                TraceEvent::LensProduced {
+                    id,
+                    attempt,
+                    lens_id,
+                    outputs,
+                } => {
+                    let kv = format_output_map(outputs);
+                    out.push_str(&format!(
+                        "  · lens {lens_id}@{id} (attempt {attempt}) — {{{kv}}}\n"
+                    ));
+                    append_output_details(&mut out, outputs, 350);
+                }
+                TraceEvent::Consolidating {
+                    id,
+                    attempt,
+                    lens_count,
+                } => {
+                    out.push_str(&format!(
+                        "⊕ consolidate {id} (attempt {attempt}, {lens_count} lens outputs)\n"
+                    ));
+                }
+                TraceEvent::FanIn {
+                    id,
+                    attempt,
+                    aggregated,
+                    strategy,
+                } => {
+                    let kv = format_output_map(aggregated);
+                    out.push_str(&format!(
+                        "⇇ fan-in  {id} (attempt {attempt}, {strategy}) — {{{kv}}}\n"
+                    ));
+                }
+                TraceEvent::Terminated { status } => {
+                    out.push_str(&format!("□ terminated: {:?}\n", status));
+                }
+            }
+        }
+        out
+    }
+}
+
+fn format_output_map(outputs: &Map<String, Value>) -> String {
+    outputs
+        .iter()
+        .filter(|(k, _)| !k.starts_with('_') && !is_detail_output_key(k))
+        .map(|(k, v)| format!("{k}={}", format_output_value(k, v)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn append_output_details(out: &mut String, outputs: &Map<String, Value>, analysis_chars: usize) {
+    append_text_detail(out, outputs, "analysis", analysis_chars);
+    append_text_detail(out, outputs, "invalid_evidence", analysis_chars.min(500));
+    append_text_detail(out, outputs, "fixes_evidence", analysis_chars.min(500));
+    append_text_detail(out, outputs, "review_dispute", analysis_chars.min(500));
+    append_fix_plan_detail(out, outputs);
+    append_followup_detail(out, outputs);
+    append_defect_detail(out, outputs, "defects");
+    append_defect_detail(out, outputs, "source_defects");
+    append_defect_detail(out, outputs, "commit_message_defects");
+    append_commit_message_detail(out, outputs);
+    append_text_detail(out, outputs, "stdout", 500);
+    append_text_detail(out, outputs, "stderr", 500);
+}
+
+fn is_detail_output_key(key: &str) -> bool {
+    matches!(
+        key,
+        "analysis"
+            | "invalid_evidence"
+            | "fixes_evidence"
+            | "review_dispute"
+            | "fix_plan"
+            | "followups"
+            | "defects"
+            | "source_defects"
+            | "commit_message_defects"
+            | "commit_message"
+            | "stdout"
+            | "stderr"
+    )
+}
+
+fn append_text_detail(out: &mut String, outputs: &Map<String, Value>, key: &str, max_chars: usize) {
+    let Some(s) = outputs.get(key).and_then(Value::as_str) else {
+        return;
+    };
+    if s.trim().is_empty() {
+        return;
+    }
+    let excerpt = truncate_chars(&clean_ws(s), max_chars);
+    out.push_str(&format!("    {key}: {excerpt}\n"));
+}
+
+fn append_fix_plan_detail(out: &mut String, outputs: &Map<String, Value>) {
+    let Some(items) = outputs.get("fix_plan").and_then(Value::as_array) else {
+        return;
+    };
+    if items.is_empty() {
+        return;
+    }
+    out.push_str("    fix_plan:\n");
+    for (idx, item) in items.iter().take(6).enumerate() {
+        let Some(obj) = item.as_object() else {
+            out.push_str(&format!(
+                "      {}. {}\n",
+                idx + 1,
+                truncate_chars(&clean_ws(&item.to_string()), 180)
+            ));
+            continue;
+        };
+        let id = obj.get("id").and_then(Value::as_str).unwrap_or("<no id>");
+        let title = obj
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("<no title>");
+        out.push_str(&format!(
+            "      {}. {id}: {}\n",
+            idx + 1,
+            truncate_chars(&clean_ws(title), 160)
+        ));
+        if let Some(scope) = obj.get("scope").and_then(Value::as_str) {
+            if !scope.trim().is_empty() {
+                out.push_str(&format!(
+                    "         scope: {}\n",
+                    truncate_chars(&clean_ws(scope), 220)
+                ));
+            }
+        }
+        if let Some(contract) = obj.get("fix_contract").and_then(Value::as_str) {
+            if !contract.trim().is_empty() {
+                out.push_str(&format!(
+                    "         fix: {}\n",
+                    truncate_chars(&clean_ws(contract), 220)
+                ));
+            }
+        }
+    }
+    if items.len() > 6 {
+        out.push_str(&format!("      ... +{} more\n", items.len() - 6));
+    }
+}
+
+fn append_followup_detail(out: &mut String, outputs: &Map<String, Value>) {
+    let Some(items) = outputs.get("followups").and_then(Value::as_array) else {
+        return;
+    };
+    if items.is_empty() {
+        return;
+    }
+    out.push_str("    followups:\n");
+    for item in items.iter().take(6) {
+        let Some(obj) = item.as_object() else {
+            out.push_str(&format!(
+                "      - {}\n",
+                truncate_chars(&clean_ws(&item.to_string()), 200)
+            ));
+            continue;
+        };
+        let kind = obj
+            .get("type")
+            .or_else(|| obj.get("kind"))
+            .and_then(Value::as_str)
+            .unwrap_or("followup");
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("<unnamed>");
+        let reason = obj.get("reason").and_then(Value::as_str).unwrap_or("");
+        if reason.trim().is_empty() {
+            out.push_str(&format!("      - {kind}:{name}\n"));
+        } else {
+            out.push_str(&format!(
+                "      - {kind}:{name} - {}\n",
+                truncate_chars(&clean_ws(reason), 220)
+            ));
+        }
+    }
+    if items.len() > 6 {
+        out.push_str(&format!("      ... +{} more\n", items.len() - 6));
+    }
+}
+
+fn append_defect_detail(out: &mut String, outputs: &Map<String, Value>, key: &str) {
+    let Some(items) = outputs.get(key).and_then(Value::as_array) else {
+        return;
+    };
+    if items.is_empty() {
+        return;
+    }
+    out.push_str(&format!("    {key}:\n"));
+    for item in items.iter().take(5) {
+        let Some(obj) = item.as_object() else {
+            out.push_str(&format!(
+                "      - {}\n",
+                truncate_chars(&clean_ws(&item.to_string()), 220)
+            ));
+            continue;
+        };
+        let where_ = obj
+            .get("where")
+            .or_else(|| obj.get("file"))
+            .or_else(|| obj.get("path"))
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let what = obj
+            .get("what")
+            .or_else(|| obj.get("summary"))
+            .and_then(Value::as_str)
+            .unwrap_or("<no summary>");
+        out.push_str(&format!(
+            "      - {where_}: {}\n",
+            truncate_chars(&clean_ws(what), 260)
+        ));
+    }
+    if items.len() > 5 {
+        out.push_str(&format!("      ... +{} more\n", items.len() - 5));
+    }
+}
+
+fn append_commit_message_detail(out: &mut String, outputs: &Map<String, Value>) {
+    let Some(s) = outputs.get("commit_message").and_then(Value::as_str) else {
+        return;
+    };
+    if s.trim().is_empty() {
+        return;
+    }
+    let mut lines = s.lines().map(str::trim).filter(|line| !line.is_empty());
+    if let Some(subject) = lines.next() {
+        out.push_str(&format!(
+            "    commit_message: {}\n",
+            truncate_chars(subject, 180)
+        ));
+    }
+    let body = lines.collect::<Vec<_>>().join(" ");
+    if !body.is_empty() {
+        out.push_str(&format!(
+            "      {}\n",
+            truncate_chars(&clean_ws(&body), 500)
+        ));
+    }
+}
+
+fn format_output_value(key: &str, value: &Value) -> String {
+    match value {
+        Value::String(s) => {
+            let max = if key == "analysis" { 240 } else { 120 };
+            format!("{:?}", truncate_chars(&clean_ws(s), max))
+        }
+        Value::Array(items) => format_output_array(items),
+        Value::Object(obj) => {
+            if obj.is_empty() {
+                "{}".to_string()
+            } else {
+                let compact = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+                truncate_chars(&compact, 160)
+            }
+        }
+        Value::Null => "null".to_string(),
+        Value::Bool(_) | Value::Number(_) => value.to_string(),
+    }
+}
+
+fn format_output_array(items: &[Value]) -> String {
+    if items.is_empty() {
+        return "[]".to_string();
+    }
+
+    let labels = items
+        .iter()
+        .take(3)
+        .map(format_array_item)
+        .collect::<Vec<_>>();
+    let tail = if items.len() > labels.len() {
+        format!(", +{} more", items.len() - labels.len())
+    } else {
+        String::new()
+    };
+    format!("[{} item(s): {}{tail}]", items.len(), labels.join(", "))
+}
+
+fn format_array_item(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("{:?}", truncate_chars(&clean_ws(s), 60)),
+        Value::Object(obj) => {
+            for key in [
+                "file",
+                "path",
+                "file_path",
+                "what",
+                "summary",
+                "title",
+                "id",
+            ] {
+                if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+                    return format!("{key}={:?}", truncate_chars(&clean_ws(s), 60));
+                }
+            }
+            let compact = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+            truncate_chars(&compact, 80)
+        }
+        _ => truncate_chars(&value.to_string(), 80),
+    }
+}
+
+fn clean_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}...", truncated.trim_end())
+    } else {
+        truncated
+    }
+}
+
+const DEFAULT_ITERATION_CAP: usize = 200;
+const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+
+/// Run a workflow with the given driver and workflow-input map.
+/// Iteration is capped at [`DEFAULT_ITERATION_CAP`] step executions
+/// to keep authoring bugs from spinning forever.
+/// Type alias for the optional event observer passed to the
+/// streaming variants of the executor. Fired after each
+/// [`TraceEvent`] is recorded so callers (the REPL, a TUI) can
+/// stream progress instead of waiting for the final
+/// `Trace::pretty()` dump.
+pub type EventObserver = Arc<dyn Fn(&TraceEvent) + Send + Sync>;
+
+/// Push `ev` into `events` AND, if an observer is wired, fire it
+/// against the just-recorded event. Replaces every direct
+/// `events.push(...)` call site so streaming and persistence share
+/// one recording path.
+fn record(events: &mut Vec<TraceEvent>, observer: &Option<EventObserver>, ev: TraceEvent) {
+    if let Some(o) = observer {
+        o(&ev);
+    }
+    events.push(ev);
+}
+
+pub async fn run<D: Driver + ?Sized + Send>(
+    workflow: &Workflow,
+    driver: &mut D,
+    inputs: Map<String, Value>,
+) -> Trace {
+    run_with_cap(workflow, driver, inputs, DEFAULT_ITERATION_CAP).await
+}
+
+/// Same as [`run_with_cap`] but fires `observer` after every
+/// trace event is recorded. Use to stream progress to a UI.
+pub async fn run_with_observer<D: Driver + ?Sized + Send>(
+    workflow: &Workflow,
+    driver: &mut D,
+    inputs: Map<String, Value>,
+    iteration_cap: usize,
+    observer: EventObserver,
+) -> Trace {
+    run_internal(
+        workflow,
+        driver,
+        inputs,
+        iteration_cap,
+        None,
+        None,
+        Some(observer),
+    )
+    .await
+}
+
+/// Resume from a previously persisted [`WorkflowSnapshot`]. The
+/// snapshot's `inputs` and `steps` seed the executor's state, so
+/// already-Done steps are skipped over by the topo walker.
+/// In-flight steps are reset to Pending so the run picks up there.
+pub async fn run_resume<D: Driver + ?Sized + Send>(
+    workflow: &Workflow,
+    driver: &mut D,
+    snapshot: WorkflowSnapshot,
+    snapshot_dir: Option<std::path::PathBuf>,
+    iteration_cap: usize,
+) -> Trace {
+    run_internal(
+        workflow,
+        driver,
+        snapshot.inputs,
+        iteration_cap,
+        Some(snapshot.steps),
+        snapshot_dir,
+        None,
+    )
+    .await
+}
+
+pub async fn run_with_cap<D: Driver + ?Sized + Send>(
+    workflow: &Workflow,
+    driver: &mut D,
+    inputs: Map<String, Value>,
+    iteration_cap: usize,
+) -> Trace {
+    run_internal(workflow, driver, inputs, iteration_cap, None, None, None).await
+}
+
+/// Variant of run_with_cap that writes a snapshot file to
+/// `snapshot_dir/workflow-<id>.json` after every state change.
+pub async fn run_with_persistence<D: Driver + ?Sized + Send>(
+    workflow: &Workflow,
+    driver: &mut D,
+    inputs: Map<String, Value>,
+    iteration_cap: usize,
+    snapshot_dir: std::path::PathBuf,
+) -> Trace {
+    run_internal(
+        workflow,
+        driver,
+        inputs,
+        iteration_cap,
+        None,
+        Some(snapshot_dir),
+        None,
+    )
+    .await
+}
+
+/// Persist workflow state while also publishing live trace events.
+pub async fn run_with_persistence_and_observer<D: Driver + ?Sized + Send>(
+    workflow: &Workflow,
+    driver: &mut D,
+    inputs: Map<String, Value>,
+    iteration_cap: usize,
+    snapshot_dir: std::path::PathBuf,
+    observer: EventObserver,
+) -> Trace {
+    run_internal(
+        workflow,
+        driver,
+        inputs,
+        iteration_cap,
+        None,
+        Some(snapshot_dir),
+        Some(observer),
+    )
+    .await
+}
+
+fn empty_objectives_state() -> StepState {
+    let mut outputs = Map::new();
+    outputs.insert("list".into(), Value::Array(Vec::new()));
+    outputs.insert("round".into(), Value::from(0u64));
+    StepState {
+        id: OBJECTIVES_STEP_ID.to_string(),
+        status: StepStatus::Done,
+        outputs,
+        ..StepState::default()
+    }
+}
+
+fn snapshot_steps(workflow: &Workflow, state: &HashMap<String, StepState>) -> Vec<StepState> {
+    let mut steps: Vec<StepState> = workflow
+        .steps
+        .iter()
+        .filter_map(|s| state.get(&s.id).cloned())
+        .collect();
+    if !workflow.steps.iter().any(|s| s.id == OBJECTIVES_STEP_ID) {
+        if let Some(ledger) = state.get(OBJECTIVES_STEP_ID) {
+            steps.push(ledger.clone());
+        }
+    }
+    steps
+}
+
+fn workflow_uses_objectives(workflow: &Workflow) -> bool {
+    workflow.id == "fix"
+        || workflow.steps.iter().any(|step| {
+            step.prompt
+                .as_deref()
+                .map(|p| p.contains("objectives."))
+                .unwrap_or(false)
+                || step
+                    .consolidate
+                    .as_ref()
+                    .map(|c| c.prompt.contains("objectives."))
+                    .unwrap_or(false)
+        })
+}
+
+fn ensure_objectives_state(state: &mut HashMap<String, StepState>, workflow: &Workflow) {
+    if workflow_uses_objectives(workflow) && !state.contains_key(OBJECTIVES_STEP_ID) {
+        state.insert(OBJECTIVES_STEP_ID.to_string(), empty_objectives_state());
+    }
+}
+
+async fn run_internal<D: Driver + ?Sized + Send>(
+    workflow: &Workflow,
+    driver: &mut D,
+    inputs: Map<String, Value>,
+    iteration_cap: usize,
+    seed_states: Option<Vec<StepState>>,
+    snapshot_dir: Option<std::path::PathBuf>,
+    observer: Option<EventObserver>,
+) -> Trace {
+    driver.begin_run();
+    let mut state: HashMap<String, StepState> = workflow
+        .steps
+        .iter()
+        .map(|s| {
+            (
+                s.id.clone(),
+                StepState {
+                    id: s.id.clone(),
+                    ..StepState::default()
+                },
+            )
+        })
+        .collect();
+    ensure_objectives_state(&mut state, workflow);
+
+    // Seed from a resume snapshot if present. Steps not in the
+    // snapshot keep their fresh-Pending state; existing steps that
+    // had never settled (Pending / BranchedAway from an
+    // interrupted run) get reset to Pending so the run picks them
+    // up again.
+    if let Some(seeds) = seed_states {
+        for s in seeds {
+            if let Some(slot) = state.get_mut(&s.id) {
+                let resumed_status = match s.status {
+                    StepStatus::Pending | StepStatus::BranchedAway
+                        if s.id != OBJECTIVES_STEP_ID =>
+                    {
+                        StepStatus::Pending
+                    }
+                    other => other,
+                };
+                *slot = StepState {
+                    status: resumed_status,
+                    ..s
+                };
+            } else if s.id == OBJECTIVES_STEP_ID {
+                state.insert(
+                    OBJECTIVES_STEP_ID.to_string(),
+                    StepState {
+                        status: StepStatus::Done,
+                        ..s
+                    },
+                );
+            }
+        }
+    }
+
+    let mut events: Vec<TraceEvent> = Vec::new();
+    let mut iterations: usize = 0;
+    let mut status = WorkflowStatus::Success;
+
+    // Helper closure: write a snapshot to disk if a dir was wired.
+    // Closures over `&state` so the executor calls this after
+    // every state change. Errors are logged but don't kill the
+    // run — losing a tick of persistence is recoverable.
+    let snapshot_save = |state: &HashMap<String, StepState>, events_count: usize| {
+        let Some(dir) = snapshot_dir.as_ref() else {
+            return;
+        };
+        let snap = WorkflowSnapshot {
+            schema_version: WorkflowSnapshot::SCHEMA_VERSION,
+            workflow_id: workflow.id.clone(),
+            inputs: inputs.clone(),
+            steps: snapshot_steps(workflow, state),
+            events_count,
+        };
+        if let Err(e) = snap.save(dir) {
+            tracing::warn!(target: "kres_agents::workflow_exec", "snapshot save failed: {e}");
+        }
+    };
+    let snapshot_save_required =
+        |state: &HashMap<String, StepState>, events_count: usize| -> Result<(), String> {
+            let Some(dir) = snapshot_dir.as_ref() else {
+                return Ok(());
+            };
+            WorkflowSnapshot {
+                schema_version: WorkflowSnapshot::SCHEMA_VERSION,
+                workflow_id: workflow.id.clone(),
+                inputs: inputs.clone(),
+                steps: snapshot_steps(workflow, state),
+                events_count,
+            }
+            .save(dir)
+            .map_err(|error| format!("persist workflow effect boundary: {error}"))
+        };
+    let finish_failure = |state: HashMap<String, StepState>,
+                          mut events: Vec<TraceEvent>,
+                          message: String| {
+        let persistence_error = snapshot_save_required(&state, events.len()).err();
+        let status = if let Some(error) = persistence_error {
+            if let Some(dir) = snapshot_dir.as_ref() {
+                let _ = std::fs::remove_file(dir.join(format!("workflow-{}.json", workflow.id)));
+            }
+            WorkflowStatus::Failure(format!(
+                "{message}; terminal state could not be persisted: {error}"
+            ))
+        } else {
+            WorkflowStatus::Failure(message)
+        };
+        record(
+            &mut events,
+            &observer,
+            TraceEvent::Terminated {
+                status: status.clone(),
+            },
+        );
+        Trace {
+            events,
+            status,
+            final_state: state,
+        }
+    };
+
+    // Initial snapshot — useful when --resume picks up a workflow
+    // that hasn't dispatched any step yet.
+    snapshot_save(&state, events.len());
+
+    loop {
+        iterations += 1;
+        if iterations > iteration_cap {
+            status = WorkflowStatus::IterationCap(iteration_cap);
+            record(
+                &mut events,
+                &observer,
+                TraceEvent::Terminated {
+                    status: status.clone(),
+                },
+            );
+            break;
+        }
+
+        // Save the latest state at the top of every iteration —
+        // captures every status transition before the next step
+        // dispatches.
+        snapshot_save(&state, events.len());
+
+        if let Some(failed) = state
+            .values()
+            .find(|step| step.status == StepStatus::TerminalFailure)
+        {
+            status = WorkflowStatus::Failure(format!(
+                "step '{}' previously reached terminal failure",
+                failed.id
+            ));
+            break;
+        }
+
+        // Accepted effects are recovered before any new model work. The
+        // payload came from the snapshot, so this path neither increments the
+        // attempt nor re-runs evaluation or ledger inference.
+        if let Some(step) = workflow
+            .steps
+            .iter()
+            .find(|step| state[&step.id].status == StepStatus::EffectsPending)
+        {
+            let attempt = state[&step.id].attempt;
+            let effects = state[&step.id]
+                .pending_effects
+                .clone()
+                .unwrap_or(Value::Null);
+            let effect_ctx = ExecContext {
+                workflow_inputs: &inputs,
+                steps: &state,
+            };
+            let effect_outputs = match driver
+                .apply_attempt_effects(step, attempt, &effects, &effect_ctx)
+                .await
+            {
+                Ok(outputs) => outputs,
+                Err(error) => {
+                    status = WorkflowStatus::Failure(format!(
+                        "step '{}' accepted effect application failed: {error}",
+                        step.id
+                    ));
+                    break;
+                }
+            };
+            if matches!(step.agent.or(workflow.defaults.agent), Some(Agent::Reaper)) {
+                record(
+                    &mut events,
+                    &observer,
+                    TraceEvent::StepProduced {
+                        id: step.id.clone(),
+                        attempt,
+                        outputs: effect_outputs.clone(),
+                    },
+                );
+            }
+            {
+                let settled = state.get_mut(&step.id).unwrap();
+                settled.outputs.extend(effect_outputs);
+                settled.status = StepStatus::Done;
+                settled.pending_effects = None;
+            }
+            if let Err(error) = snapshot_save_required(&state, events.len()) {
+                let unsettled = state.get_mut(&step.id).unwrap();
+                unsettled.status = StepStatus::EffectsPending;
+                unsettled.pending_effects = Some(effects);
+                status = WorkflowStatus::Failure(format!(
+                    "step '{}' completion was not durable: {error}",
+                    step.id
+                ));
+                break;
+            }
+            if step.terminal_on_success {
+                status = WorkflowStatus::TerminalSuccess(step.id.clone());
+                record(
+                    &mut events,
+                    &observer,
+                    TraceEvent::Terminated {
+                        status: status.clone(),
+                    },
+                );
+                return Trace {
+                    events,
+                    status,
+                    final_state: state,
+                };
+            }
+            continue;
+        }
+
+        // Check Workflow.completion expressions before scheduling
+        // the next step. failure_when_any wins over success_when_any
+        // so a half-finished pipeline that's already in trouble
+        // doesn't get reported as Success because some lower-priority
+        // success expression evaluated true at the same time.
+        if let Some(c) = &workflow.completion {
+            let cctx = ExecContext {
+                workflow_inputs: &inputs,
+                steps: &state,
+            };
+            for expr in &c.failure_when_any {
+                if let Ok(true) = expr::eval(expr, &cctx, None) {
+                    status = WorkflowStatus::Failure(format!(
+                        "completion.failure_when_any matched: {expr}"
+                    ));
+                    record(
+                        &mut events,
+                        &observer,
+                        TraceEvent::Terminated {
+                            status: status.clone(),
+                        },
+                    );
+                    return Trace {
+                        events,
+                        status,
+                        final_state: state,
+                    };
+                }
+            }
+            for expr in &c.success_when_any {
+                if let Ok(true) = expr::eval(expr, &cctx, None) {
+                    status = WorkflowStatus::TerminalSuccess(format!(
+                        "completion.success_when_any matched: {expr}"
+                    ));
+                    record(
+                        &mut events,
+                        &observer,
+                        TraceEvent::Terminated {
+                            status: status.clone(),
+                        },
+                    );
+                    return Trace {
+                        events,
+                        status,
+                        final_state: state,
+                    };
+                }
+            }
+        }
+
+        let next_idx = workflow.steps.iter().position(|s| {
+            matches!(state[&s.id].status, StepStatus::Pending)
+                && s.depends_on.iter().all(|d| {
+                    matches!(
+                        state.get(d).map(|st| st.status),
+                        Some(StepStatus::Done)
+                            | Some(StepStatus::Skipped)
+                            | Some(StepStatus::DoneWithFailure)
+                    )
+                })
+        });
+        let Some(idx) = next_idx else {
+            // Nothing left to schedule. If anything is still
+            // Pending, it's blocked — that's a deadlock from bad
+            // depends_on, treat as failure for visibility.
+            if state.values().any(|s| s.status == StepStatus::Pending) {
+                let stuck: Vec<String> = state
+                    .values()
+                    .filter(|s| s.status == StepStatus::Pending)
+                    .map(|s| s.id.clone())
+                    .collect();
+                status = WorkflowStatus::Failure(format!("deadlocked, pending steps: {stuck:?}"));
+            }
+            break;
+        };
+        let step = &workflow.steps[idx];
+
+        // Conditional skip — run_if false OR skip_if true.
+        let ctx_for_skip = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &state,
+        };
+        if let Some(rf) = &step.run_if {
+            match expr::eval(rf, &ctx_for_skip, Some(&step.id)) {
+                Ok(false) => {
+                    record(
+                        &mut events,
+                        &observer,
+                        TraceEvent::StepSkipped {
+                            id: step.id.clone(),
+                            reason: format!("run_if `{rf}` was false"),
+                        },
+                    );
+                    let st = state.get_mut(&step.id).unwrap();
+                    st.status = StepStatus::Skipped;
+                    st.reuse_gathered_context = false;
+                    if step.preserve_outputs_on_skip {
+                        if st.outputs.is_empty() && !st.preserved_outputs_on_skip.is_empty() {
+                            st.outputs = std::mem::take(&mut st.preserved_outputs_on_skip);
+                        }
+                    } else {
+                        st.outputs.clear();
+                        st.preserved_outputs_on_skip.clear();
+                    }
+                    continue;
+                }
+                Ok(true) => {}
+                Err(e) => {
+                    status = WorkflowStatus::Failure(format!(
+                        "step '{}' run_if eval error: {e}",
+                        step.id
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(sf) = &step.skip_if {
+            match expr::eval(sf, &ctx_for_skip, Some(&step.id)) {
+                Ok(true) => {
+                    record(
+                        &mut events,
+                        &observer,
+                        TraceEvent::StepSkipped {
+                            id: step.id.clone(),
+                            reason: format!("skip_if `{sf}` was true"),
+                        },
+                    );
+                    let st = state.get_mut(&step.id).unwrap();
+                    st.status = StepStatus::Skipped;
+                    st.reuse_gathered_context = false;
+                    if step.preserve_outputs_on_skip {
+                        if st.outputs.is_empty() && !st.preserved_outputs_on_skip.is_empty() {
+                            st.outputs = std::mem::take(&mut st.preserved_outputs_on_skip);
+                        }
+                    } else {
+                        st.outputs.clear();
+                        st.preserved_outputs_on_skip.clear();
+                    }
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    status = WorkflowStatus::Failure(format!(
+                        "step '{}' skip_if eval error: {e}",
+                        step.id
+                    ));
+                    break;
+                }
+            }
+        }
+
+        // Run the step.
+        let attempt = state[&step.id].attempt + 1;
+        state.get_mut(&step.id).unwrap().attempt = attempt;
+        record(
+            &mut events,
+            &observer,
+            TraceEvent::StepStarted {
+                id: step.id.clone(),
+                attempt,
+            },
+        );
+        if matches!(step.agent.or(workflow.defaults.agent), Some(Agent::Reaper)) {
+            let effect_ctx = ExecContext {
+                workflow_inputs: &inputs,
+                steps: &state,
+            };
+            let effects = match driver.attempt_effects(step, attempt, &effect_ctx).await {
+                Ok(effects) => effects,
+                Err(error) => {
+                    status = WorkflowStatus::Failure(format!(
+                        "reaper step '{}' could not serialize intent: {error}",
+                        step.id
+                    ));
+                    break;
+                }
+            };
+            let accepted = state.get_mut(&step.id).unwrap();
+            accepted.status = StepStatus::EffectsPending;
+            accepted.pending_effects = Some(effects);
+            if let Err(error) = snapshot_save_required(&state, events.len()) {
+                status = WorkflowStatus::Failure(format!(
+                    "reaper step '{}' intent was not durable: {error}",
+                    step.id
+                ));
+                break;
+            }
+            continue;
+        }
+        let driver_ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &state,
+        };
+
+        let outputs = if step.lenses.is_empty() {
+            let driver_result = driver.run(step, attempt, &driver_ctx, None).await;
+            match driver_result {
+                Ok(o) => o,
+                Err(e) => {
+                    driver.discard_attempt(step, attempt).await;
+                    let retried = match self_correctable_driver_detail(&e) {
+                        Some(detail) => retry_self_correctable_driver_error(
+                            &mut state,
+                            &mut events,
+                            &observer,
+                            step,
+                            attempt,
+                            &detail,
+                        ),
+                        None => retry_driver_error(
+                            &mut state,
+                            &mut events,
+                            &observer,
+                            step,
+                            attempt,
+                            &format!("driver error: {e}"),
+                        ),
+                    };
+                    if retried {
+                        continue;
+                    }
+                    return finish_failure(
+                        state,
+                        events,
+                        format!("step '{}' driver error on attempt {attempt}: {e}", step.id),
+                    );
+                }
+            }
+        } else {
+            let active = match active_lenses(step, &driver_ctx) {
+                Ok(active) => active,
+                Err(e) => {
+                    status = WorkflowStatus::Failure(format!(
+                        "step '{}' lens condition error on attempt {attempt}: {e}",
+                        step.id
+                    ));
+                    record(
+                        &mut events,
+                        &observer,
+                        TraceEvent::Terminated {
+                            status: status.clone(),
+                        },
+                    );
+                    return Trace {
+                        events,
+                        status,
+                        final_state: state,
+                    };
+                }
+            };
+            let mut active_step = step.clone();
+            active_step.lenses = active.iter().map(|lens| (*lens).clone()).collect();
+            // Lensed step. Emit FanOut once up-front; both the
+            // optimised path and the per-lens fall-back share it.
+            let lens_ids: Vec<String> = active_step.lenses.iter().map(|l| l.id.clone()).collect();
+            record(
+                &mut events,
+                &observer,
+                TraceEvent::FanOut {
+                    id: step.id.clone(),
+                    attempt,
+                    lens_ids: lens_ids.clone(),
+                },
+            );
+            // Try the optimised single-gather + fan-out + consolidate
+            // path first when aggregate=Consolidate AND the driver
+            // advertises support for it. On success, return the
+            // aggregated map out of the lens block so the standard
+            // eval and durable effect acceptance below run. Runtime/schema
+            // errors from a supported optimised path consume the
+            // step retry budget instead of silently falling back to
+            // the old repeated-gather loop.
+            let mut optimised: Option<Map<String, Value>> = None;
+            if matches!(
+                active_step.aggregate.unwrap_or_default(),
+                Aggregate::Consolidate
+            ) {
+                match driver
+                    .lens_fan_out_consolidate(&active_step, attempt, &driver_ctx)
+                    .await
+                {
+                    Ok(LensFanOutConsolidate::Outputs(aggregated)) => {
+                        record(
+                            &mut events,
+                            &observer,
+                            TraceEvent::Consolidating {
+                                id: step.id.clone(),
+                                attempt,
+                                lens_count: active_step.lenses.len(),
+                            },
+                        );
+                        record(
+                            &mut events,
+                            &observer,
+                            TraceEvent::FanIn {
+                                id: step.id.clone(),
+                                attempt,
+                                aggregated: aggregated.clone(),
+                                strategy: "Consolidate".into(),
+                            },
+                        );
+                        optimised = Some(aggregated);
+                    }
+                    Ok(LensFanOutConsolidate::Unsupported) => {}
+                    Err(e) => {
+                        driver.discard_attempt(step, attempt).await;
+                        // This path reports a String rather than a
+                        // DriverError, so the over-capability case
+                        // cannot be recognised without parsing our own
+                        // Display output. Lens steps declare an eval,
+                        // so they already have a retry budget here.
+                        if retry_driver_error(
+                            &mut state,
+                            &mut events,
+                            &observer,
+                            step,
+                            attempt,
+                            &format!("shared lens fan-out driver error: {e}"),
+                        ) {
+                            snapshot_save(&state, events.len());
+                            continue;
+                        }
+                        return finish_failure(
+                            state,
+                            events,
+                            format!(
+                                "step '{}' shared lens fan-out attempt {attempt} driver error: {e}",
+                                step.id
+                            ),
+                        );
+                    }
+                }
+            }
+            // If the optimised path produced an aggregate, return
+            // it out of the lens block so the standard eval +
+            // durable effect acceptance below runs. The per-lens fall-back
+            // only fires when optimised is None.
+            if let Some(aggregated) = optimised {
+                aggregated
+            } else {
+                // Per-lens fall-back path. Fan out N concurrent driver
+                // calls, aggregate when they all settle.
+                // Fix #10: skip lenses that already have a saved result
+                // from a prior interrupted run. Resume reads
+                // step.lens_outputs out of the snapshot; lenses with
+                // an entry there don't re-run.
+                let already_done: std::collections::BTreeSet<String> =
+                    state[&step.id].lens_outputs.keys().cloned().collect();
+                let lenses_to_run: Vec<&Lens> = active_step
+                    .lenses
+                    .iter()
+                    .filter(|l| !already_done.contains(&l.id))
+                    .collect();
+                let futures: Vec<_> = lenses_to_run
+                    .iter()
+                    .map(|lens| {
+                        let driver_ref = &driver;
+                        let ctx_ref = &driver_ctx;
+                        let step_ref = &active_step;
+                        let lens_ref = *lens;
+                        async move {
+                            let r = driver_ref
+                                .run(step_ref, attempt, ctx_ref, Some(lens_ref))
+                                .await;
+                            (lens_ref.id.clone(), r)
+                        }
+                    })
+                    .collect();
+                type LensResult = (String, Result<Map<String, Value>, DriverError>);
+                let lens_results: Vec<LensResult> = futures::future::join_all(futures).await;
+                // Seed per_lens with already-saved entries first, then
+                // fold in fresh results.
+                let mut per_lens: Vec<(String, Map<String, Value>)> = active_step
+                    .lenses
+                    .iter()
+                    .filter_map(|l| {
+                        state[&step.id]
+                            .lens_outputs
+                            .get(&l.id)
+                            .and_then(|v| v.as_object().cloned())
+                            .map(|m| (l.id.clone(), m))
+                    })
+                    .collect();
+                let mut first_err: Option<(String, DriverError)> = None;
+                for (lens_id, r) in lens_results {
+                    match r {
+                        Ok(m) => {
+                            record(
+                                &mut events,
+                                &observer,
+                                TraceEvent::LensProduced {
+                                    id: step.id.clone(),
+                                    attempt,
+                                    lens_id: lens_id.clone(),
+                                    outputs: m.clone(),
+                                },
+                            );
+                            // Persist the per-lens result before the
+                            // next snapshot tick (Fix #10).
+                            state
+                                .get_mut(&step.id)
+                                .unwrap()
+                                .lens_outputs
+                                .insert(lens_id.clone(), Value::Object(m.clone()));
+                            per_lens.push((lens_id, m));
+                        }
+                        Err(e) => {
+                            if first_err.is_none() {
+                                first_err = Some((lens_id, e));
+                            }
+                        }
+                    }
+                }
+                // Order per_lens to match step.lenses ordering for
+                // determinism (matters for concat aggregator).
+                let lens_order: std::collections::HashMap<&str, usize> = active_step
+                    .lenses
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| (l.id.as_str(), i))
+                    .collect();
+                per_lens.sort_by_key(|(id, _)| *lens_order.get(id.as_str()).unwrap_or(&usize::MAX));
+                if let Some((lens_id, e)) = first_err {
+                    driver.discard_attempt(step, attempt).await;
+                    let detail = self_correctable_driver_detail(&e);
+                    let retried = match &detail {
+                        Some(detail) => retry_self_correctable_driver_error(
+                            &mut state,
+                            &mut events,
+                            &observer,
+                            step,
+                            attempt,
+                            detail,
+                        ),
+                        None => retry_driver_error(
+                            &mut state,
+                            &mut events,
+                            &observer,
+                            step,
+                            attempt,
+                            &format!("lens '{lens_id}' driver error: {e}"),
+                        ),
+                    };
+                    if retried {
+                        snapshot_save(&state, events.len());
+                        continue;
+                    }
+                    return finish_failure(
+                        state,
+                        events,
+                        format!(
+                            "step '{}' lens '{lens_id}' attempt {attempt} driver error: {e}",
+                            step.id
+                        ),
+                    );
+                }
+                let strategy = step.aggregate.unwrap_or_default();
+                let aggregated = match strategy {
+                    Aggregate::Concat | Aggregate::ByLens => {
+                        aggregate_lens_outputs(&active_step, &per_lens, strategy)
+                    }
+                    Aggregate::Consolidate => {
+                        record(
+                            &mut events,
+                            &observer,
+                            TraceEvent::Consolidating {
+                                id: step.id.clone(),
+                                attempt,
+                                lens_count: per_lens.len(),
+                            },
+                        );
+                        let cctx = ExecContext {
+                            workflow_inputs: &inputs,
+                            steps: &state,
+                        };
+                        match driver.consolidate(&active_step, &cctx, &per_lens).await {
+                            Ok(m) => m,
+                            Err(e) => {
+                                driver.discard_attempt(step, attempt).await;
+                                // A consolidate failure means the fan-in could not
+                                // trust the per-lens outputs it just merged. Clear
+                                // cached lens outputs before retrying so the next
+                                // attempt gets fresh lens contexts instead of
+                                // replaying the same inconsistent maps.
+                                state.get_mut(&step.id).unwrap().lens_outputs.clear();
+                                let detail = self_correctable_driver_detail(&e);
+                                let retried = match &detail {
+                                    Some(detail) => retry_self_correctable_driver_error(
+                                        &mut state,
+                                        &mut events,
+                                        &observer,
+                                        step,
+                                        attempt,
+                                        detail,
+                                    ),
+                                    None => retry_driver_error(
+                                        &mut state,
+                                        &mut events,
+                                        &observer,
+                                        step,
+                                        attempt,
+                                        &format!("consolidate error: {e}"),
+                                    ),
+                                };
+                                if retried {
+                                    snapshot_save(&state, events.len());
+                                    continue;
+                                }
+                                return finish_failure(
+                                    state,
+                                    events,
+                                    format!(
+                                        "step '{}' consolidate (attempt {attempt}) failed: {e}",
+                                        step.id
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                };
+                record(
+                    &mut events,
+                    &observer,
+                    TraceEvent::FanIn {
+                        id: step.id.clone(),
+                        attempt,
+                        aggregated: aggregated.clone(),
+                        strategy: format!("{strategy:?}"),
+                    },
+                );
+                // Aggregation's done — discard the partial per-lens
+                // map so the next attempt (after an eval-fail repeat)
+                // starts fresh. Without this a re-attempt would skip
+                // every lens since they're all "already saved".
+                state.get_mut(&step.id).unwrap().lens_outputs.clear();
+                aggregated
+            } // else: per-lens fall-back close
+        };
+
+        state.get_mut(&step.id).unwrap().outputs = outputs.clone();
+        state
+            .get_mut(&step.id)
+            .unwrap()
+            .preserved_outputs_on_skip
+            .clear();
+        record(
+            &mut events,
+            &observer,
+            TraceEvent::StepProduced {
+                id: step.id.clone(),
+                attempt,
+                outputs,
+            },
+        );
+        // Eval, if configured.
+        let Some(eval) = &step.eval else {
+            if step_owns_objectives(step) {
+                let produced = state
+                    .get(&step.id)
+                    .map(|st| st.outputs.clone())
+                    .unwrap_or_default();
+                merge_emitted_objectives(&mut state, &produced);
+            }
+            let effect_ctx = ExecContext {
+                workflow_inputs: &inputs,
+                steps: &state,
+            };
+            let effects = match driver.attempt_effects(step, attempt, &effect_ctx).await {
+                Ok(effects) => effects,
+                Err(error) => {
+                    driver.discard_attempt(step, attempt).await;
+                    status = WorkflowStatus::Failure(format!(
+                        "step '{}' could not serialize accepted effects: {error}",
+                        step.id
+                    ));
+                    break;
+                }
+            };
+            {
+                let accepted = state.get_mut(&step.id).unwrap();
+                accepted.status = StepStatus::EffectsPending;
+                accepted.pending_effects = Some(effects);
+            }
+            if let Err(error) = snapshot_save_required(&state, events.len()) {
+                driver.discard_attempt(step, attempt).await;
+                status = WorkflowStatus::Failure(format!(
+                    "step '{}' accepted effects were not durable: {error}",
+                    step.id
+                ));
+                break;
+            }
+            continue;
+        };
+        let ctx_for_eval = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &state,
+        };
+        let (passed, eval_reason) = match eval.kind {
+            crate::workflow::EvalKind::FieldCheck => {
+                let expr_str = match eval.expr.as_deref() {
+                    Some(s) => s,
+                    None => {
+                        driver.discard_attempt(step, attempt).await;
+                        status = WorkflowStatus::Failure(format!(
+                            "step '{}' field_check eval missing expr",
+                            step.id
+                        ));
+                        break;
+                    }
+                };
+                match expr::eval(expr_str, &ctx_for_eval, Some(&step.id)) {
+                    Ok(b) => (b, None),
+                    Err(e) => {
+                        driver.discard_attempt(step, attempt).await;
+                        status = WorkflowStatus::Failure(format!(
+                            "step '{}' eval expr error: {e}",
+                            step.id
+                        ));
+                        break;
+                    }
+                }
+            }
+            crate::workflow::EvalKind::Builtin => {
+                let name = match eval.name.as_deref() {
+                    Some(s) => s,
+                    None => {
+                        driver.discard_attempt(step, attempt).await;
+                        status = WorkflowStatus::Failure(format!(
+                            "step '{}' builtin eval missing name",
+                            step.id
+                        ));
+                        break;
+                    }
+                };
+                match eval_builtin(name, step, &ctx_for_eval) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        driver.discard_attempt(step, attempt).await;
+                        status = WorkflowStatus::Failure(format!(
+                            "step '{}' builtin eval error: {e}",
+                            step.id
+                        ));
+                        break;
+                    }
+                }
+            }
+            crate::workflow::EvalKind::JudgeLlm => match driver.judge(step, &ctx_for_eval).await {
+                Ok((p, reason)) => {
+                    let reason = if reason.trim().is_empty() {
+                        None
+                    } else {
+                        Some(reason)
+                    };
+                    (p, reason)
+                }
+                Err(e) => {
+                    driver.discard_attempt(step, attempt).await;
+                    status = WorkflowStatus::Failure(format!(
+                        "step '{}' judge_llm eval error: {e}",
+                        step.id
+                    ));
+                    break;
+                }
+            },
+        };
+
+        if passed {
+            record(
+                &mut events,
+                &observer,
+                TraceEvent::EvalPassed {
+                    id: step.id.clone(),
+                    attempt,
+                },
+            );
+            if let Some(accepted) = state.get_mut(&step.id) {
+                accepted.last_eval_reason = None;
+            }
+            if step_owns_objectives(step) {
+                let produced = state
+                    .get(&step.id)
+                    .map(|st| st.outputs.clone())
+                    .unwrap_or_default();
+                merge_emitted_objectives(&mut state, &produced);
+            }
+            let effect_ctx = ExecContext {
+                workflow_inputs: &inputs,
+                steps: &state,
+            };
+            let effects = match driver.attempt_effects(step, attempt, &effect_ctx).await {
+                Ok(effects) => effects,
+                Err(error) => {
+                    driver.discard_attempt(step, attempt).await;
+                    status = WorkflowStatus::Failure(format!(
+                        "step '{}' could not serialize accepted effects: {error}",
+                        step.id
+                    ));
+                    break;
+                }
+            };
+            {
+                let accepted = state.get_mut(&step.id).unwrap();
+                accepted.reuse_gathered_context = false;
+                accepted.status = StepStatus::EffectsPending;
+                accepted.pending_effects = Some(effects);
+            }
+            if let Err(error) = snapshot_save_required(&state, events.len()) {
+                driver.discard_attempt(step, attempt).await;
+                status = WorkflowStatus::Failure(format!(
+                    "step '{}' accepted effects were not durable: {error}",
+                    step.id
+                ));
+                break;
+            }
+            continue;
+        }
+
+        // Eval failed.
+        driver.discard_attempt(step, attempt).await;
+        let st = state.get_mut(&step.id).unwrap();
+        st.eval_failures += 1;
+        // Hand the rejection back to the next attempt. The eval already
+        // states precisely what was wrong; the retry used to be told
+        // only its attempt number.
+        //
+        // Only when the next thing to happen is THIS step trying
+        // again. A `branch_to` eval is not a rejection of the output —
+        // it is how a correct output moves control somewhere else, and
+        // `previous_rejection_block` renders whatever lands here as
+        // "Your last response for this step was not accepted".
+        //
+        // Every shipped `branch_to` is of that second kind. The
+        // orchestrator's `orchestrator_dispatch` returns
+        // `(false, "route to <step>")` because returning false is how
+        // `branch_to_output` is triggered at all; `review` fails
+        // `clean == true` precisely when it did its job and found
+        // defects; `validate-refute` fails `refutation.refuted ==
+        // false` when it successfully refutes.
+        //
+        // On the 2026-08-20 futex2 series, finding
+        // `futex_private_hash_put_uaf_mm`: the orchestrator routed to
+        // write-commit-message, the branch was taken, and the step was
+        // then re-prompted with "Your last response for this step was
+        // not accepted: route to write-commit-message". It replied
+        // that its "next_step was rejected only because it emitted
+        // 'route to write-commit-message' as prose instead of the
+        // required JSON shape", re-issued the identical decision, and
+        // on the pass after that concluded that "the only worker that
+        // can land O4 is write-commit-message, and that routing was
+        // rejected for this step … That leaves no worker step that can
+        // discharge the open objective" — and picked exit-failure. The
+        // source fix was already complete and every lens had passed it.
+        st.last_eval_reason = match eval.on_fail.action {
+            OnFailAction::Repeat | OnFailAction::RerunChain => eval_reason.clone(),
+            OnFailAction::BranchTo | OnFailAction::Continue | OnFailAction::ExitFailure => None,
+        };
+
+        let eval_failures = st.eval_failures;
+        let max = eval.on_fail.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
+        let exhausted = attempt >= max;
+        let action_label = match eval_reason.as_deref() {
+            Some(reason) => format!("{:?} ({reason})", eval.on_fail.action),
+            None => format!("{:?}", eval.on_fail.action),
+        };
+        record(
+            &mut events,
+            &observer,
+            TraceEvent::EvalFailed {
+                id: step.id.clone(),
+                attempt,
+                action: action_label,
+                eval_failures,
+            },
+        );
+
+        if exhausted {
+            let on_exhausted = eval
+                .on_fail
+                .on_exhausted
+                .unwrap_or(OnExhausted::ExitFailure);
+            record(
+                &mut events,
+                &observer,
+                TraceEvent::Exhausted {
+                    id: step.id.clone(),
+                    on_exhausted: format!("{:?}", on_exhausted),
+                    attempts: attempt,
+                },
+            );
+            match on_exhausted {
+                OnExhausted::ExitFailure => {
+                    let exhausted = state.get_mut(&step.id).unwrap();
+                    exhausted.reuse_gathered_context = false;
+                    exhausted.status = StepStatus::TerminalFailure;
+                    return finish_failure(
+                        state,
+                        events,
+                        format!("step '{}' exhausted after {attempt} attempts", step.id),
+                    );
+                }
+                OnExhausted::Continue => {
+                    let exhausted = state.get_mut(&step.id).unwrap();
+                    exhausted.reuse_gathered_context = false;
+                    exhausted.status = StepStatus::DoneWithFailure;
+                    continue;
+                }
+                OnExhausted::BranchTo => {
+                    let target = match resolve_branch_target(&eval.on_fail, &state, &step.id) {
+                        Ok(target) => target,
+                        Err(e) => {
+                            status = WorkflowStatus::Failure(format!(
+                                "step '{}' on_exhausted branch_to failed: {e}",
+                                step.id
+                            ));
+                            break;
+                        }
+                    };
+                    if !state.contains_key(&target) {
+                        status = WorkflowStatus::Failure(format!(
+                            "step '{}' on_exhausted branch_to unknown step '{target}'",
+                            step.id
+                        ));
+                        break;
+                    }
+                    record(
+                        &mut events,
+                        &observer,
+                        TraceEvent::BranchedTo {
+                            from: step.id.clone(),
+                            to: target.clone(),
+                        },
+                    );
+                    // Reset the target + every transitive dependent
+                    // (which includes the branching step itself,
+                    // since the branching step's depends_on chain
+                    // leads back to the target). The topo walker
+                    // picks them up once the target re-completes.
+                    reset_for_reentry(&mut state, &target);
+                    reset_dependents_preserving(workflow, &mut state, &target, Some(&step.id));
+                    // Defensive — if the branching step is NOT in
+                    // the dependents chain (workflow author wired
+                    // them up loosely), reset it explicitly too.
+                    reset_for_reentry_preserve_outputs(&mut state, &step.id);
+                    // Same reason as the non-exhausted branch above:
+                    // control moved, the output was not rejected.
+                    if let Some(branched) = state.get_mut(&step.id) {
+                        branched.last_eval_reason = None;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Not exhausted — dispatch the action.
+        match eval.on_fail.action {
+            OnFailAction::Repeat => {
+                let st = state.get_mut(&step.id).unwrap();
+                // Stash this attempt's outputs so the next attempt's
+                // prompt can read them via `{{<step>.prior_attempts}}`,
+                // letting the model see what it proposed before and
+                // either commit to that shape or justify a change.
+                // The eval-fail Repeat path is only reached after
+                // StepProduced populates st.outputs, so the snapshot
+                // is always meaningful.
+                let snapshot = std::mem::take(&mut st.outputs);
+                st.prior_attempts.push(snapshot);
+                st.reuse_gathered_context = true;
+                st.status = StepStatus::Pending;
+            }
+            OnFailAction::RerunChain => {
+                let ids = eval.on_fail.rerun.clone();
+                record(
+                    &mut events,
+                    &observer,
+                    TraceEvent::RerunChain {
+                        from: step.id.clone(),
+                        ids: ids.clone(),
+                    },
+                );
+                for r in &ids {
+                    if state.contains_key(r) {
+                        reset_for_reentry(&mut state, r);
+                    }
+                }
+                // Make sure the current step itself is reschedulable.
+                let current = state.get_mut(&step.id).unwrap();
+                current.reuse_gathered_context = false;
+                current.status = StepStatus::Pending;
+            }
+            OnFailAction::BranchTo => {
+                let target = match resolve_branch_target(&eval.on_fail, &state, &step.id) {
+                    Ok(target) => target,
+                    Err(e) => {
+                        status = WorkflowStatus::Failure(format!(
+                            "step '{}' on_fail branch_to failed: {e}",
+                            step.id
+                        ));
+                        break;
+                    }
+                };
+                if !state.contains_key(&target) {
+                    status = WorkflowStatus::Failure(format!(
+                        "step '{}' on_fail branch_to unknown step '{target}'",
+                        step.id
+                    ));
+                    break;
+                }
+                record(
+                    &mut events,
+                    &observer,
+                    TraceEvent::BranchedTo {
+                        from: step.id.clone(),
+                        to: target.clone(),
+                    },
+                );
+                // Keep what the branching step said. Repeat and
+                // reset_for_reentry both snapshot a rejected attempt
+                // into prior_attempts, and the cascade does it for
+                // steps downstream of the target -- but the branch
+                // source is explicitly exempted just below, and on the
+                // next pass its run_if usually skips it, so its outputs
+                // were the one rejected attempt nothing kept.
+                //
+                // That is exactly the record worth keeping. validate's
+                // refutation steps branch precisely when a model broke
+                // the finding: six did so in a 113-finding batch and
+                // left no trace in the snapshot, recoverable only from
+                // the raw JSONL.
+                //
+                // Skipped when the branch points back at this same step
+                // -- `branch_to_output` resolves its target from these
+                // very outputs, so a step can name itself -- because
+                // reset_for_reentry below snapshots the target and would
+                // otherwise record the attempt twice.
+                if target != step.id {
+                    if let Some(source) = state.get_mut(&step.id) {
+                        if !source.outputs.is_empty() {
+                            let rejected = source.outputs.clone();
+                            source.prior_attempts.push(rejected);
+                        }
+                    }
+                }
+                reset_for_reentry(&mut state, &target);
+                reset_dependents_preserving(workflow, &mut state, &target, Some(&step.id));
+                // The branching step itself needs to be re-runnable
+                // only when the target is upstream (and will cascade
+                // back through dependents). If the target is
+                // downstream of the source — review→orchestrator,
+                // for instance — leave the source Done so the target
+                // can consume its outputs without the source
+                // re-running first.
+                if target_depends_on_source(workflow, &target, &step.id) {
+                    // Downstream branch (e.g. review→orchestrator):
+                    // the target needs the source's outputs to drive
+                    // its decision, and the source must not re-run
+                    // before the target can clear its depends_on.
+                    // Settle the source as Done so the picker passes
+                    // over it and runs the target next.
+                    if let Some(st) = state.get_mut(&step.id) {
+                        st.reuse_gathered_context = false;
+                        st.status = StepStatus::Done;
+                    }
+                } else {
+                    reset_for_reentry_preserve_outputs(&mut state, &step.id);
+                }
+            }
+            OnFailAction::Continue => {
+                let failed = state.get_mut(&step.id).unwrap();
+                failed.reuse_gathered_context = false;
+                failed.status = StepStatus::DoneWithFailure;
+            }
+            OnFailAction::ExitFailure => {
+                let failed = state.get_mut(&step.id).unwrap();
+                failed.reuse_gathered_context = false;
+                failed.status = StepStatus::TerminalFailure;
+                return finish_failure(
+                    state,
+                    events,
+                    format!("step '{}' on_fail.action = exit_failure", step.id),
+                );
+            }
+        }
+    }
+
+    if !matches!(events.last(), Some(TraceEvent::Terminated { .. })) {
+        record(
+            &mut events,
+            &observer,
+            TraceEvent::Terminated {
+                status: status.clone(),
+            },
+        );
+    }
+
+    // Final snapshot on terminal exit so --resume of a finished
+    // workflow shows the right end state.
+    snapshot_save(&state, events.len());
+
+    Trace {
+        events,
+        status,
+        final_state: state,
+    }
+}
+
+/// Reset a step to Pending so the topo walker picks it up again.
+/// Attempt counter is preserved so eval expressions like
+/// `step.attempt <= 3` keep ticking across re-entries.
+fn reset_for_reentry(state: &mut HashMap<String, StepState>, id: &str) {
+    if let Some(st) = state.get_mut(id) {
+        st.status = StepStatus::Pending;
+        // A re-entry re-runs a step inside THIS run against the same
+        // workspace, so the source it already fetched is still the
+        // source it needs. The driver drops the whole gathered cache
+        // whenever a step stages a real source file, so anything left
+        // in it is current by construction — see
+        // `is_workflow_scratch_artifact` in workflow_runner.rs.
+        //
+        // Forcing this false made the orchestrator's branch_to pay for
+        // a full re-gather every cycle. On the 2026-08-10 linux.nfs fix
+        // run `write-commit-message` was re-entered 10 times and spent
+        // 38 fast-gather rounds re-reading `dentry_create`, `do_open`
+        // and `may_open`, none of which had changed.
+        //
+        // Only a re-entry sets this. A step's first attempt in a fresh
+        // run still starts from its dependencies alone, so a Driver
+        // reused across runs cannot leak one run's gather into the
+        // next.
+        st.reuse_gathered_context = true;
+        // The step's previous outputs encoded a real attempt at this
+        // step's job; whatever drove the reset (branch_to from a
+        // downstream eval, on_exhausted branch_to, or rerun_chain)
+        // implicitly rejected that attempt. Snapshot it into
+        // prior_attempts so the next attempt's prompt can read it via
+        // `{{<step>.prior_attempts}}`, matching the Repeat path.
+        if !st.outputs.is_empty() {
+            let snapshot = std::mem::take(&mut st.outputs);
+            st.prior_attempts.push(snapshot);
+        }
+        st.preserved_outputs_on_skip.clear();
+    }
+}
+
+fn reset_for_reentry_preserve_outputs(state: &mut HashMap<String, StepState>, id: &str) {
+    if let Some(st) = state.get_mut(id) {
+        st.status = StepStatus::Pending;
+        // Same-run re-entry: reuse the gather. See `reset_for_reentry`.
+        st.reuse_gathered_context = true;
+        st.preserved_outputs_on_skip.clear();
+    }
+}
+
+/// True iff `target` transitively depends on `source` — i.e.
+/// `target` is downstream of `source` in the workflow graph. Used by
+/// the branch_to action to decide whether the branching step
+/// (`source`) should be reset to Pending. If `target` is downstream,
+/// resetting the source would force it to re-run before the target
+/// could ever clear its depends_on, defeating the point of the
+/// downstream branch. If `target` is upstream or unrelated, the
+/// source needs to be Pending so the cascade re-runs it.
+fn target_depends_on_source(workflow: &Workflow, target: &str, source: &str) -> bool {
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack: Vec<String> = vec![target.to_string()];
+    while let Some(cur) = stack.pop() {
+        if !visited.insert(cur.clone()) {
+            continue;
+        }
+        let Some(step) = workflow.steps.iter().find(|s| s.id == cur) else {
+            continue;
+        };
+        for dep in &step.depends_on {
+            if dep == source {
+                return true;
+            }
+            stack.push(dep.clone());
+        }
+    }
+    false
+}
+
+fn resolve_branch_target(
+    on_fail: &crate::workflow::OnFail,
+    state: &HashMap<String, StepState>,
+    current_step: &str,
+) -> Result<String, String> {
+    if let Some(target) = on_fail.branch_to.as_deref() {
+        return Ok(target.to_string());
+    }
+
+    let Some(output_key) = on_fail.branch_to_output.as_deref() else {
+        return Err("missing branch_to or branch_to_output".to_string());
+    };
+    let step = state
+        .get(current_step)
+        .ok_or_else(|| format!("current step '{current_step}' not found"))?;
+    let value = step
+        .outputs
+        .get(output_key)
+        .ok_or_else(|| format!("branch_to_output '{output_key}' is missing from step outputs"))?;
+    let Some(target) = value.as_str() else {
+        return Err(format!(
+            "branch_to_output '{output_key}' must be a string, got {value}"
+        ));
+    };
+    if target.is_empty() {
+        return Err(format!("branch_to_output '{output_key}' is empty"));
+    }
+    Ok(target.to_string())
+}
+
+/// Attempts allowed for a driver error that the agent can itself
+/// resolve, on a step with no eval block of its own.
+///
+/// An over-capability request is the case: the agent asked for more
+/// evidence than the model can read, and the only thing that fixes it
+/// is the agent asking for less. Without this a step without an eval
+/// had no retry budget at all, so one oversized followup killed the
+/// whole workflow -- a fix run died on a patch-bearing git log over a
+/// whole file that was 3.4 MB by itself.
+const SELF_CORRECTABLE_DRIVER_ATTEMPTS: u32 = 3;
+
+/// Whether the next attempt can plausibly avoid this error by asking
+/// for different evidence, and what to tell it if so.
+///
+/// Only over-capability qualifies today. Nothing is trimmed to recover:
+/// the request that did not fit is abandoned whole and the agent is
+/// told the size it overshot, so the evidence it gathers next is its
+/// own smaller choice rather than a silent truncation of this one.
+fn self_correctable_driver_detail(error: &DriverError) -> Option<String> {
+    match error {
+        DriverError::OverInputLimit {
+            actual,
+            limit,
+            step,
+        } => Some(format!(
+            "the evidence gathered for step '{step}' came to {actual} tokens against a \
+             {limit}-token model input capability, so the request was never sent. Nothing \
+             was truncated. Gather the same conclusion from less: ask for the specific \
+             functions, line ranges or commits you need rather than whole files or whole \
+             histories, and prefer a listing that identifies what you want over one that \
+             includes its full contents."
+        )),
+        _ => None,
+    }
+}
+
+fn retry_driver_error(
+    state: &mut HashMap<String, StepState>,
+    events: &mut Vec<TraceEvent>,
+    observer: &Option<EventObserver>,
+    step: &Step,
+    attempt: u32,
+    detail: &str,
+) -> bool {
+    retry_driver_error_inner(state, events, observer, step, attempt, detail, false)
+}
+
+/// As above, for an error the next attempt can avoid by asking
+/// differently. Grants a budget even when the step declares no eval,
+/// and hands the reason to that attempt so it knows what to change.
+fn retry_self_correctable_driver_error(
+    state: &mut HashMap<String, StepState>,
+    events: &mut Vec<TraceEvent>,
+    observer: &Option<EventObserver>,
+    step: &Step,
+    attempt: u32,
+    detail: &str,
+) -> bool {
+    retry_driver_error_inner(state, events, observer, step, attempt, detail, true)
+}
+
+fn retry_driver_error_inner(
+    state: &mut HashMap<String, StepState>,
+    events: &mut Vec<TraceEvent>,
+    observer: &Option<EventObserver>,
+    step: &Step,
+    attempt: u32,
+    detail: &str,
+    self_correctable: bool,
+) -> bool {
+    // Every retry is told what went wrong. Re-running a step blind
+    // reproduces whatever the agent did the first time, which for an
+    // over-capability request means asking for the same oversized
+    // evidence again.
+    if let Some(st) = state.get_mut(&step.id) {
+        st.last_eval_reason = Some(detail.to_string());
+    }
+    let Some(eval) = &step.eval else {
+        if !self_correctable {
+            if let Some(st) = state.get_mut(&step.id) {
+                st.reuse_gathered_context = false;
+                st.status = StepStatus::Pending;
+            }
+            return false;
+        }
+        let st = state.get_mut(&step.id).unwrap();
+        st.eval_failures += 1;
+        st.reuse_gathered_context = false;
+        let exhausted = attempt >= SELF_CORRECTABLE_DRIVER_ATTEMPTS;
+        st.status = if exhausted {
+            StepStatus::TerminalFailure
+        } else {
+            StepStatus::Pending
+        };
+        let eval_failures = st.eval_failures;
+        record(
+            events,
+            observer,
+            TraceEvent::EvalFailed {
+                id: step.id.clone(),
+                attempt,
+                action: format!("Repeat ({detail})"),
+                eval_failures,
+            },
+        );
+        return !exhausted;
+    };
+    let max = eval.on_fail.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
+    let st = state.get_mut(&step.id).unwrap();
+    st.eval_failures += 1;
+    st.reuse_gathered_context = false;
+    let exhausted = attempt >= max;
+    st.status = if exhausted {
+        StepStatus::TerminalFailure
+    } else {
+        StepStatus::Pending
+    };
+    record(
+        events,
+        observer,
+        TraceEvent::EvalFailed {
+            id: step.id.clone(),
+            attempt,
+            action: format!("Repeat ({detail})"),
+            eval_failures: st.eval_failures,
+        },
+    );
+    if exhausted {
+        record(
+            events,
+            observer,
+            TraceEvent::Exhausted {
+                id: step.id.clone(),
+                on_exhausted: "ExitFailure".to_string(),
+                attempts: attempt,
+            },
+        );
+    }
+    !exhausted
+}
+
+fn eval_builtin(
+    name: &str,
+    step: &Step,
+    ctx: &ExecContext<'_>,
+) -> Result<(bool, Option<String>), String> {
+    match name {
+        "fix_research_status" => Ok(eval_fix_research_status(step, ctx)),
+        "fix_series_assessment" => Ok(eval_fix_series_assessment(step, ctx)),
+        "orchestrator_dispatch" => Ok(eval_orchestrator_dispatch(step, ctx)),
+        "reconcile_covers_every_defect" => Ok(eval_reconcile_covers_every_defect(step, ctx)),
+        "validate_claims_wellformed" => Ok(eval_validate_claims_wellformed(step, ctx)),
+        "validate_verdict_consistency" => Ok(eval_validate_verdict_consistency(step, ctx)),
+        other => Err(format!("unknown builtin eval '{other}'")),
+    }
+}
+
+/// The reconciliation step turns N lens reports into ONE instruction
+/// set, so its load-bearing property is that nothing vanished on the
+/// way: every review defect must end up either driving an instruction
+/// or explicitly dropped with a reason.
+///
+/// That is a quantifier over two typed arrays, which the workflow
+/// expression language cannot state, so it is a builtin — the same
+/// reason `validate_claims_wellformed` is one. Rust numbers the
+/// defects when it renders them into the prompt, so `covers` is an
+/// index into `review.defects` and cannot be satisfied by paraphrase.
+fn eval_reconcile_covers_every_defect(
+    step: &Step,
+    ctx: &ExecContext<'_>,
+) -> (bool, Option<String>) {
+    let defects = ctx
+        .steps
+        .get("review")
+        .and_then(|state| state.outputs.get("defects"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let Some(outputs) = ctx.steps.get(&step.id).map(|state| &state.outputs) else {
+        return eval_fail("current step outputs are missing");
+    };
+    let instructions = outputs
+        .get("instructions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let dropped = outputs
+        .get("dropped")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+
+    // Escalation is about objectives, which persist across rounds, so
+    // it is checked even on a round whose own defect list is empty --
+    // a stale objective must not escape the rule just because this
+    // cycle's review happened to report nothing.
+    if defects.is_empty() {
+        return stale_objectives_are_escalated(step, ctx);
+    }
+    if instructions.is_empty() && dropped.is_empty() {
+        return eval_fail(&format!(
+            "review reported {} defect(s) but this step produced no instructions and dropped \
+             nothing; every defect must drive an instruction or be dropped with a reason",
+            defects.len()
+        ));
+    }
+
+    let mut covered: BTreeSet<i64> = BTreeSet::new();
+    let mut instructed: BTreeSet<i64> = BTreeSet::new();
+    let mut abandoned: BTreeSet<i64> = BTreeSet::new();
+    let mut out_of_range: Vec<i64> = Vec::new();
+    for (label, entries) in [("instructions", instructions), ("dropped", dropped)] {
+        for (position, entry) in entries.iter().enumerate() {
+            let Some(covers) = entry.get("covers").and_then(Value::as_array) else {
+                return eval_fail(&format!(
+                    "{label}[{position}] is missing `covers`; it must list the NUMBERED REVIEW \
+                     DEFECT indices this entry accounts for"
+                ));
+            };
+            // An INSTRUCTION covering no numbered defect is fine: the
+            // pass may add work the review did not itemise, e.g. a
+            // changelog edit implied by an objective. The invariant is
+            // that every DEFECT is covered, not that every instruction
+            // covers one. Rejecting these cost the 2026-08-10 18:35
+            // linux.nfs run its whole reconciliation: four defects were
+            // covered correctly and two extra commit_message entries
+            // carried `covers: []`.
+            //
+            // A DROPPED entry covering nothing is still vacuous -- it
+            // claims to abandon a defect without naming one.
+            if covers.is_empty() && label == "dropped" {
+                return eval_fail(&format!(
+                    "dropped[{position}].covers is empty; name the defect index this entry \
+                     abandons"
+                ));
+            }
+            for index in covers {
+                let Some(index) = index.as_i64() else {
+                    return eval_fail(&format!(
+                        "{label}[{position}].covers must contain integers indexing the NUMBERED \
+                         REVIEW DEFECTS block"
+                    ));
+                };
+                if index < 0 || index as usize >= defects.len() {
+                    out_of_range.push(index);
+                } else {
+                    covered.insert(index);
+                    if label == "instructions" {
+                        instructed.insert(index);
+                    } else {
+                        abandoned.insert(index);
+                    }
+                }
+            }
+        }
+    }
+    // Instructed AND dropped is not a merge, it is a contradiction:
+    // the worker would act on a defect the record says was abandoned.
+    let both: Vec<i64> = instructed.intersection(&abandoned).copied().collect();
+    if !both.is_empty() {
+        return eval_fail(&format!(
+            "defect index {both:?} appears in both instructions[].covers and \
+             dropped[].covers; a defect is either carried forward or dropped, not both"
+        ));
+    }
+    if !out_of_range.is_empty() {
+        return eval_fail(&format!(
+            "covers references defect index {out_of_range:?} but review reported {} defect(s), \
+             numbered 0..{}",
+            defects.len(),
+            defects.len() - 1
+        ));
+    }
+    let missing: Vec<usize> = (0..defects.len())
+        .filter(|index| !covered.contains(&(*index as i64)))
+        .collect();
+    if !missing.is_empty() {
+        let detail = missing
+            .iter()
+            .take(6)
+            .map(|index| {
+                let what = defects[*index]
+                    .get("what")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let lens = defects[*index]
+                    .get("lens")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                format!(
+                    "#{index} [{lens}] {}",
+                    what.chars().take(90).collect::<String>()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return eval_fail(&format!(
+            "these review defects are in neither instructions[].covers nor dropped[].covers: \
+             {detail}. Carry each one into an instruction or drop it with a reason — a defect \
+             that is simply absent will be re-reported by the same lens next round"
+        ));
+    }
+
+    stale_objectives_are_escalated(step, ctx)
+}
+
+/// The forward-progress rule.
+///
+/// The fix loop is supposed to converge. What it did on the 2026-08-10
+/// linux.nfs run was ask for the same thing ten times: the review
+/// raised the missing permission check on the new `vfs_open()`
+/// fallback in all ten rounds, the reconciliation answered with
+/// fifteen comment and kerneldoc rewrites, and the patch shipped
+/// without `may_open()`.
+///
+/// Policing the WORDING of the ask was the first attempt at this, and
+/// it was both rigid and easy to slip past. Measuring whether the ask
+/// WORKED is neither: once an objective has been open for
+/// `OBJECTIVE_STALE_ROUNDS` cycles the pass must stop spreading effort
+/// and commit -- name one stale objective in `must_fix`, or settle it
+/// as satisfied or withdrawn on evidence.
+///
+/// Rust owns the ages (`merge_emitted_objectives`), so this cannot be
+/// satisfied by a model reporting an old objective as new.
+fn stale_objectives_are_escalated(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
+    let Some(outputs) = ctx.steps.get(&step.id).map(|state| &state.outputs) else {
+        return (true, None);
+    };
+    let emitted = outputs
+        .get("objectives")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let must_fix = outputs
+        .get("must_fix")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+
+    // Ages come from the store, which the model does not write.
+    let held: Vec<&Value> = ctx
+        .steps
+        .get(OBJECTIVES_STEP_ID)
+        .and_then(|state| state.outputs.get("list"))
+        .and_then(Value::as_array)
+        .map(|list| list.iter().collect())
+        .unwrap_or_default();
+    let age_of = |id: &str| -> u64 {
+        held.iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+            .and_then(|item| item.get("rounds_open").and_then(Value::as_u64))
+            .unwrap_or(0)
+    };
+
+    let mut stale: Vec<String> = Vec::new();
+    for objective in emitted {
+        let Some(id) = objective.get("id").and_then(Value::as_str) else {
+            return eval_fail("every objective needs a non-empty id so its age can be tracked");
+        };
+        let status = objective
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if status != "open" {
+            continue;
+        }
+        // +1: re-emitting it keeps it open through the round being
+        // reconciled now, which the store has not counted yet.
+        if age_of(id) + 1 >= OBJECTIVE_STALE_ROUNDS {
+            stale.push(id.to_string());
+        }
+    }
+    if stale.is_empty() || stale.iter().any(|id| id == must_fix) {
+        return (true, None);
+    }
+    eval_fail(&format!(
+        "objective(s) {stale:?} have been open for {} review cycle(s) or more and this pass \
+         neither settled them nor committed to one. Asking a third time will produce a third \
+         refusal. Either name one of them in `must_fix` -- which tells the review and the \
+         workers that nothing else matters until it lands -- or mark it satisfied with the \
+         evidence, or withdraw it with the scope statement that puts it out of contract",
+        OBJECTIVE_STALE_ROUNDS
+    ))
+}
+
+/// Every claim the validation pass emitted, in one flat list.
+fn claim_entries<'a>(ctx: &'a ExecContext<'_>, step_id: &str) -> Option<&'a Vec<Value>> {
+    ctx.steps
+        .get(step_id)?
+        .outputs
+        .get("claim_validation")?
+        .get("claims")?
+        .as_array()
+}
+
+fn claim_field<'a>(claim: &'a Value, key: &str) -> Option<&'a str> {
+    claim.get(key).and_then(Value::as_str)
+}
+
+fn claim_is_gating(claim: &Value) -> bool {
+    claim
+        .get("gating")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Builtin eval for `validate-claims`.
+///
+/// Checks the two things a later model must not be free to reinterpret:
+/// that the claim record is well formed, and that no gating claim is
+/// marked supported on the strength of the finding quoting itself.
+///
+/// The second one is the mechanical form of a rule the pass already
+/// states. A validation that confirms a finding using only text pasted
+/// inside that finding has verified nothing, and the fast agent has been
+/// observed noticing this unprompted ("this body was only supplied via
+/// the finding's own embedded quote") while still filing the claim.
+fn eval_validate_claims_wellformed(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
+    let Some(outputs) = ctx.steps.get(&step.id).map(|state| &state.outputs) else {
+        return eval_fail("current step outputs are missing");
+    };
+    let Some(report) = outputs.get("claim_validation").and_then(Value::as_object) else {
+        return eval_fail("claim_validation must be an object");
+    };
+    if report.get("schema_version").and_then(Value::as_i64) != Some(1) {
+        return eval_fail("claim_validation.schema_version must be 1");
+    }
+    if report
+        .get("thesis")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return eval_fail(
+            "claim_validation.thesis must state in one sentence what the finding claims is broken; \
+             the conjunction step tests the claims against it",
+        );
+    }
+    let Some(design_intent) = report.get("design_intent") else {
+        return eval_fail("claim_validation.design_intent is required");
+    };
+    if design_intent.get("checked").and_then(Value::as_bool) != Some(true) {
+        return eval_fail(
+            "claim_validation.design_intent.checked is false: look for the leading comment, an \
+             enumerated design table, or the introducing commit before treating the behaviour as \
+             a defect, then set checked true with what you found (or null evidence if none)",
+        );
+    }
+    let Some(claims) = report.get("claims").and_then(Value::as_array) else {
+        return eval_fail("claim_validation.claims must be an array");
+    };
+    if claims.is_empty() {
+        return eval_fail("claim_validation.claims is empty: the finding makes at least one claim");
+    }
+
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut quoted_only: Vec<&str> = Vec::new();
+    let mut missing_need: Vec<&str> = Vec::new();
+    let mut unevidenced: Vec<&str> = Vec::new();
+    for claim in claims {
+        let Some(id) = claim_field(claim, "id").filter(|id| !id.trim().is_empty()) else {
+            return eval_fail("every claim needs a non-empty id");
+        };
+        if !seen.insert(id) {
+            return eval_fail(&format!("duplicate claim id '{id}'"));
+        }
+        let verdict = claim_field(claim, "verdict").unwrap_or_default();
+        let evidence = claim
+            .get("evidence")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        match verdict {
+            "unresolved" => {
+                if claim_field(claim, "source_needed")
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    missing_need.push(id);
+                }
+            }
+            "supported" | "contradicted" => {
+                if evidence.is_empty() {
+                    unevidenced.push(id);
+                } else if claim_is_gating(claim)
+                    && verdict == "supported"
+                    && evidence.iter().all(|e| {
+                        e.get("provenance").and_then(Value::as_str) == Some("finding_quoted")
+                    })
+                {
+                    quoted_only.push(id);
+                }
+            }
+            other => {
+                return eval_fail(&format!(
+                    "claim '{id}' has verdict '{other}'; expected supported, contradicted or unresolved"
+                ))
+            }
+        }
+    }
+    if !unevidenced.is_empty() {
+        return eval_fail(&format!(
+            "claim(s) [{}] are supported or contradicted with no evidence entry",
+            unevidenced.join(", ")
+        ));
+    }
+    if !missing_need.is_empty() {
+        return eval_fail(&format!(
+            "unresolved claim(s) [{}] must name in source_needed exactly what would settle them",
+            missing_need.join(", ")
+        ));
+    }
+    if !quoted_only.is_empty() {
+        return eval_fail(&format!(
+            "gating claim(s) [{}] are supported only by finding_quoted evidence: fetch the \
+             definition, callers or history and re-check, or mark the claim unresolved. \
+             Confirming a finding from the finding's own quotations verifies nothing",
+            quoted_only.join(", ")
+        ));
+    }
+
+    // The citation lint. `citation_check` is machine-populated by the
+    // driver, which is the only place holding the workspace and the
+    // evidence the fetcher returned.
+    if let Some(check) = outputs.get("citation_check") {
+        let list = |key: &str| -> Vec<String> {
+            check
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let unresolved = list("unresolved");
+        if !unresolved.is_empty() {
+            return eval_fail(&format!(
+                "citation(s) do not resolve against the source workspace: {}. Cite a file and \
+                 line you actually read",
+                unresolved.join("; ")
+            ));
+        }
+        // `unbacked_fresh` is recorded but does NOT fail the step, and
+        // that is a measured decision rather than a soft touch. Replayed
+        // over 113 real claim reports it fired 14 times across 11 runs
+        // (9.7%), and the cases examined were correct claims: a grep
+        // result is delivered as bare `61:SCHED_FEAT(PARANOID_AVG,
+        // false)` lines with no filename, so a file the run genuinely
+        // searched never appears in the delivered evidence. Failing on
+        // that would reject a tenth of all runs for being right.
+        //
+        // Making it enforceable means giving search results their
+        // filename; until then the signal is worth keeping in the
+        // artifacts and not worth gating on.
+        let unbacked = list("unbacked_fresh");
+        if !unbacked.is_empty() {
+            kres_core::async_eprintln!(
+                "[citation lint] {} citation(s) marked fresh name a file absent from the \
+                 fetched evidence: {}",
+                unbacked.len(),
+                unbacked.join("; ")
+            );
+        }
+    }
+    (true, None)
+}
+
+/// Builtin eval for `validate-reachability`.
+///
+/// Supersedes the old field_check. It keeps that check's file-side
+/// guarantees (summary/severity actually written, triage_coding present
+/// and agreeing with severity) and adds the three reasoning invariants
+/// the prompt could only ask for politely:
+///
+///   1. a gating claim left unresolved caps the verdict below Plausible
+///      unless it is settled here with evidence,
+///   2. a conflicting precondition pair does the same until addressed,
+///   3. Plausible needs one named configuration where the finding fires.
+///
+/// These exist because the prompt already said (1) and runs preserved
+/// findings anyway by relabelling the unresolved component as a
+/// "probability/severity question, not an existence question". Prompt
+/// text the same model can talk itself out of is not a control.
+fn eval_validate_verdict_consistency(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
+    let Some(outputs) = ctx.steps.get(&step.id).map(|state| &state.outputs) else {
+        return eval_fail("current step outputs are missing");
+    };
+    let Some(verdict) = output_str(outputs, "verdict") else {
+        return eval_fail("verdict must be a string");
+    };
+    let Some(severity) = output_str(outputs, "severity") else {
+        return eval_fail("severity must be a string");
+    };
+    if output_bool(outputs, "summary_written") != Some(true) {
+        return eval_fail("summary.md was not written with non-empty content");
+    }
+    if output_bool(outputs, "severity_written") != Some(true) {
+        return eval_fail(
+            "summary.md, metadata.yaml and FINDING.md must all be emitted into the finding \
+             directory carrying the chosen severity",
+        );
+    }
+    let Some(coding) = outputs.get("triage_coding").and_then(Value::as_object) else {
+        return eval_fail("triage_coding must be an object");
+    };
+    if coding.get("schema_version").and_then(Value::as_i64) != Some(1) {
+        return eval_fail("triage_coding.schema_version must be 1");
+    }
+    if coding.get("severity").and_then(Value::as_str) != Some(severity) {
+        return eval_fail("triage_coding.severity must match the severity output");
+    }
+    let expected_status = match verdict {
+        "Fixed" => "fixed",
+        "Plausible" => "plausible",
+        "Unconfirmed" => "unconfirmed",
+        "Unknown" => "unknown",
+        "Invalid" => "invalid",
+        "ConfirmedLatent" => "confirmed_latent",
+        "NotADefect" => "not_a_defect",
+        other => return eval_fail(&format!("unknown verdict '{other}'")),
+    };
+    if coding.get("summary_status").and_then(Value::as_str) != Some(expected_status) {
+        return eval_fail(&format!(
+            "verdict '{verdict}' requires triage_coding.summary_status '{expected_status}'"
+        ));
+    }
+
+    // Everything below constrains Plausible only. A finding the run
+    // could not stand up is allowed to land on any of the other
+    // verdicts without further proof.
+    if verdict != "Plausible" {
+        return (true, None);
+    }
+
+    let settled: BTreeSet<&str> = outputs
+        .get("gating_override")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    !entry
+                        .get("evidence")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .is_empty()
+                })
+                .filter_map(|entry| entry.get("claim_id").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(claims) = claim_entries(ctx, "validate-claims") {
+        let open: Vec<&str> = claims
+            .iter()
+            .filter(|claim| {
+                claim_is_gating(claim) && claim_field(claim, "verdict") == Some("unresolved")
+            })
+            .filter_map(|claim| claim_field(claim, "id"))
+            .filter(|id| !settled.contains(id))
+            .collect();
+        if !open.is_empty() {
+            return eval_fail(&format!(
+                "gating claim(s) [{}] are still unresolved, so the finding cannot be Plausible. \
+                 Settle each one here with file:line evidence in gating_override, or choose \
+                 Unconfirmed, ConfirmedLatent, NotADefect or Invalid. Recasting a gating claim as \
+                 a probability, frequency or severity question does not settle it",
+                open.join(", ")
+            ));
+        }
+    }
+
+    let conjunction = ctx
+        .steps
+        .get("validate-conjunction")
+        .and_then(|state| state.outputs.get("conjunction"));
+    let Some(conjunction) = conjunction else {
+        // The conjunction step is part of this workflow; if a variant
+        // drops it, do not silently relax the other checks.
+        return (true, None);
+    };
+
+    if let Some(conflicts) = conjunction.get("conflicts").and_then(Value::as_array) {
+        let addressed: BTreeSet<(String, String)> = outputs
+            .get("conflict_resolution")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| {
+                        !entry
+                            .get("evidence")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .unwrap_or_default()
+                            .is_empty()
+                    })
+                    .filter_map(|entry| {
+                        Some((
+                            entry.get("a_id")?.as_str()?.to_string(),
+                            entry.get("b_id")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let unaddressed: Vec<String> = conflicts
+            .iter()
+            .filter_map(|conflict| {
+                let a = conflict.get("a_id")?.as_str()?.to_string();
+                let b = conflict.get("b_id")?.as_str()?.to_string();
+                let covered = addressed.contains(&(a.clone(), b.clone()))
+                    || addressed.contains(&(b.clone(), a.clone()));
+                (!covered).then(|| format!("{a}/{b}"))
+            })
+            .collect();
+        if !unaddressed.is_empty() {
+            return eval_fail(&format!(
+                "conflicting precondition pair(s) [{}] were reported and not addressed. Two claims \
+                 that cannot hold on one execution make the finding impossible; resolve each pair \
+                 in conflict_resolution with evidence, or pick a verdict below Plausible",
+                unaddressed.join(", ")
+            ));
+        }
+    }
+
+    // A refutation that nobody answered stands. Either refuter is
+    // enough: they are asked to break the finding, not to vote, and a
+    // refutation carries evidence while a survival does not. Biasing
+    // toward the refuter is the point of a false-positive-elimination
+    // pass.
+    let answered: BTreeSet<&str> = outputs
+        .get("refutation_rebuttal")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    !entry
+                        .get("evidence")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .is_empty()
+                })
+                .filter_map(|entry| entry.get("refuter").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    let unanswered: Vec<&str> = ["validate-refute", "validate-refute-secondary"]
+        .into_iter()
+        .filter(|id| {
+            ctx.steps
+                .get(*id)
+                .and_then(|state| state.outputs.get("refutation"))
+                .and_then(|refutation| refutation.get("refuted"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter(|id| !answered.contains(id))
+        .collect();
+    if !unanswered.is_empty() {
+        return eval_fail(&format!(
+            "refutation(s) from [{}] were not answered. A finding an independent pass could \
+             break is not Plausible: answer each in refutation_rebuttal with evidence, or take \
+             a verdict below Plausible",
+            unanswered.join(", ")
+        ));
+    }
+
+    // Either step may supply the witness. The conjunction step reasons
+    // over the claim report alone; this one has fetched source and can
+    // establish a configuration the earlier pass could not see. Without
+    // its own channel the eval asked for something the step had no field
+    // to emit, and a run that had resolved both conflicts spent all
+    // three attempts re-asserting Plausible before dying.
+    // A witness is a named place the defect fires. Structural validity
+    // is not enough: the schema permits `call_site: ""`, and a witness
+    // with no site is the same "nobody could name one" the check exists
+    // to catch, wearing an object.
+    let witnessed = |value: Option<&Value>| {
+        value.is_some_and(|w| {
+            !w.is_null()
+                && !w
+                    .get("call_site")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+        })
+    };
+    if witnessed(conjunction.get("single_execution_witness"))
+        || witnessed(outputs.get("execution_witness"))
+    {
+        return (true, None);
+    }
+    eval_fail(
+        "no execution witness: nobody has named one configuration where every gating \
+         precondition holds and the defect fires. Plausible claims the bad path executes, so \
+         either establish the witness yourself in execution_witness, or choose ConfirmedLatent, \
+         Unconfirmed, NotADefect or Invalid",
+    )
+}
+
+fn eval_fix_series_assessment(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
+    let Some(outputs) = ctx.steps.get(&step.id).map(|state| &state.outputs) else {
+        return eval_fail("current step outputs are missing");
+    };
+    let Some(complete) = output_bool(outputs, "complete") else {
+        return eval_fail("complete must be a boolean");
+    };
+    let Some(decision) = output_str(outputs, "decision") else {
+        return eval_fail("decision must be a string");
+    };
+    if complete != (decision == "complete") {
+        return eval_fail("complete and decision are inconsistent");
+    }
+
+    let Some(remaining_work) = outputs.get("remaining_work").and_then(Value::as_array) else {
+        return eval_fail("remaining_work must be an array");
+    };
+    if complete && !remaining_work.is_empty() {
+        return eval_fail("a complete assessment cannot have remaining_work");
+    }
+    if decision == "revise_pending_plan" {
+        if remaining_work.is_empty() {
+            return eval_fail("revise_pending_plan requires remaining_work");
+        }
+        if !outputs.get("plan_update").is_some_and(Value::is_object) {
+            return eval_fail("revise_pending_plan requires plan_update");
+        }
+    }
+
+    let Some(tracked) = ctx
+        .workflow_inputs
+        .get("fix_series_state")
+        .and_then(|state| state.get("original_bugs"))
+        .and_then(Value::as_array)
+    else {
+        return eval_fail("fix_series_state.original_bugs must be an array");
+    };
+    let expected = tracked
+        .iter()
+        .filter_map(|item| item.get("id")?.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if expected.len() != tracked.len() {
+        return eval_fail("fix_series_state contains missing or duplicate original bug ids");
+    }
+    let Some(outcomes) = outputs.get("outcomes").and_then(Value::as_array) else {
+        return eval_fail("outcomes must be an array");
+    };
+    let mut actual = std::collections::BTreeSet::new();
+    for (index, outcome) in outcomes.iter().enumerate() {
+        let Some(object) = outcome.as_object() else {
+            return eval_fail(&format!("outcomes[{index}] must be an object"));
+        };
+        if object.len() != 3
+            || !object.contains_key("bug")
+            || !object.contains_key("outcome")
+            || !object.contains_key("evidence")
+        {
+            return eval_fail(&format!(
+                "outcomes[{index}] must contain exactly bug, outcome, and evidence"
+            ));
+        }
+        let Some(bug) = object
+            .get("bug")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            return eval_fail(&format!("outcomes[{index}].bug must be non-empty"));
+        };
+        let Some(disposition) = object.get("outcome").and_then(Value::as_str) else {
+            return eval_fail(&format!("outcomes[{index}].outcome must be a string"));
+        };
+        if !matches!(
+            disposition,
+            "fixed" | "invalidated" | "duplicate" | "unresolved"
+        ) {
+            return eval_fail(&format!(
+                "outcomes[{index}].outcome '{disposition}' is invalid"
+            ));
+        }
+        let Some(_evidence) = object
+            .get("evidence")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return eval_fail(&format!("outcomes[{index}].evidence must be non-empty"));
+        };
+        if complete && !matches!(disposition, "fixed" | "invalidated" | "duplicate") {
+            return eval_fail(&format!(
+                "outcomes[{index}].outcome '{disposition}' is not a completed disposition"
+            ));
+        }
+        if !actual.insert(bug) {
+            return eval_fail(&format!("outcomes contains duplicate bug id '{bug}'"));
+        }
+    }
+    if actual != expected {
+        return eval_fail("outcomes must cover every original bug exactly once");
+    }
+    if complete || matches!(decision, "revise_pending_plan" | "failure") {
+        (true, None)
+    } else {
+        eval_fail(&format!("series assessment decision is '{decision}'"))
+    }
+}
+
+fn eval_fix_research_status(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
+    let Some(outputs) = ctx.steps.get(&step.id).map(|st| &st.outputs) else {
+        return eval_fail("current step outputs are missing");
+    };
+    let Some(status) = output_str(outputs, "research_status") else {
+        return eval_fail("research_status must be a string");
+    };
+    let Some(valid) = output_bool(outputs, "valid") else {
+        return eval_fail("valid must be a boolean");
+    };
+    let Some(invalid_evidence) = output_str(outputs, "invalid_evidence") else {
+        return eval_fail("invalid_evidence must be a string");
+    };
+    let Some(invalid_evidence_kind) = output_str(outputs, "invalid_evidence_kind") else {
+        return eval_fail("invalid_evidence_kind must be a string");
+    };
+    if !crate::followup::no_blocking_followups_json(outputs.get("followups")) {
+        return eval_fail(
+            "research emitted blocking followups, so it cannot terminally classify the finding yet",
+        );
+    }
+
+    let decision = outputs
+        .get("research_decision")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let Some(bug_proven) = decision_bool(&decision, "bug_proven") else {
+        return eval_fail("research_decision.bug_proven must be a boolean");
+    };
+    let Some(fix_contract_proven) = decision_bool(&decision, "fix_contract_proven") else {
+        return eval_fail("research_decision.fix_contract_proven must be a boolean");
+    };
+    let Some(invalidity_proven) = decision_bool(&decision, "invalidity_proven") else {
+        return eval_fail("research_decision.invalidity_proven must be a boolean");
+    };
+    let Some(needs_more_audit) = decision_bool(&decision, "needs_more_audit") else {
+        return eval_fail("research_decision.needs_more_audit must be a boolean");
+    };
+
+    let ok = match status {
+        "confirmed" => {
+            valid
+                && invalid_evidence.is_empty()
+                && invalid_evidence_kind == "none"
+                && bug_proven
+                && fix_contract_proven
+                && !invalidity_proven
+                && !needs_more_audit
+        }
+        "invalid" => {
+            !valid
+                && !invalid_evidence.trim().is_empty()
+                && invalid_evidence_kind == "source_or_commit_evidence"
+                && !bug_proven
+                && !fix_contract_proven
+                && invalidity_proven
+                && !needs_more_audit
+        }
+        "unconfirmed" => {
+            !valid
+                && invalid_evidence.is_empty()
+                && invalid_evidence_kind == "none"
+                && !invalidity_proven
+                && (!bug_proven || !fix_contract_proven || needs_more_audit)
+        }
+        // `unexecutable` says the fix contract cannot be carried out
+        // by THIS step whatever it reads next — the planner asked for
+        // a capability the step does not have. `needs_more_audit ==
+        // false` is the discriminator against `unconfirmed`: if
+        // another gather round could settle it, that is unconfirmed.
+        //
+        // The typed requirement is mandatory. Without it the status is
+        // an unfalsifiable "I give up", which is what it exists to
+        // replace.
+        "unexecutable" => {
+            let requirement = output_str(outputs, "unexecutable_requirement").unwrap_or("none");
+            let detail = output_str(outputs, "unexecutable_detail").unwrap_or("");
+            if requirement == "none" || detail.trim().is_empty() {
+                return eval_fail(
+                    "research_status 'unexecutable' needs unexecutable_requirement (not 'none') \
+                     and a non-empty unexecutable_detail naming the missing capability",
+                );
+            }
+            !valid
+                && invalid_evidence.is_empty()
+                && invalid_evidence_kind == "none"
+                && !invalidity_proven
+                && !fix_contract_proven
+                && !needs_more_audit
+        }
+        other => return eval_fail(&format!("unknown research_status '{other}'")),
+    };
+    if ok {
+        (true, None)
+    } else {
+        eval_fail(&format!(
+            "research_status '{status}' is inconsistent with valid/invalid_evidence/research_decision"
+        ))
+    }
+}
+
+fn eval_fail(reason: &str) -> (bool, Option<String>) {
+    (false, Some(reason.to_string()))
+}
+
+/// Builtin eval for the workflow-step orchestrator. The orchestrator
+/// emits one of {write-patch, write-commit-message, publish,
+/// exit-failure} as `next_step`. The exec loop's branching contract
+/// expects:
+///
+/// - eval passes (true) → workflow continues to the next step in
+///   topological order. We want this when next_step is `publish`
+///   (so record-results + publish fire) or `exit-failure` (so the
+///   completion.failure_when_any catches it on the next tick — no
+///   need to branch anywhere).
+/// - eval fails (false) → `on_fail.branch_to_output = "next_step"`
+///   fires, branching to the named step. We want this when
+///   next_step is `write-patch` or `write-commit-message`.
+///
+/// So pass on `publish` / `exit-failure`, fail (to trigger the
+/// branch) on `write-patch` / `write-commit-message`.
+fn eval_orchestrator_dispatch(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
+    let Some(outputs) = ctx.steps.get(&step.id).map(|st| &st.outputs) else {
+        return eval_fail("current step outputs are missing");
+    };
+    let Some(next_step) = output_str(outputs, "next_step") else {
+        return eval_fail("next_step must be a string");
+    };
+    match next_step {
+        "publish" | "exit-failure" => (true, None),
+        "write-patch" | "write-commit-message" | "build" => {
+            (false, Some(format!("route to {next_step}")))
+        }
+        other => eval_fail(&format!(
+            "orchestrator emitted unknown next_step '{other}'; expected one of write-patch, write-commit-message, build, publish, exit-failure"
+        )),
+    }
+}
+
+fn output_str<'a>(outputs: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    outputs.get(key).and_then(Value::as_str)
+}
+
+fn output_bool(outputs: &Map<String, Value>, key: &str) -> Option<bool> {
+    outputs.get(key).and_then(Value::as_bool)
+}
+
+fn decision_bool(decision: &Map<String, Value>, key: &str) -> Option<bool> {
+    decision.get(key).and_then(Value::as_bool)
+}
+
+/// Combine per-lens output maps into one aggregated map per the
+/// step's `aggregate` strategy.
+///
+/// `Concat` (default): for each declared output key, if every lens
+/// produced an array, concatenate them in lens order. Otherwise
+/// build `[{lens, value}, ...]` so callers don't lose which lens
+/// said what.
+///
+/// `ByLens`: every declared key maps to `{lens_id_1: value_1,
+/// lens_id_2: value_2, ...}`.
+///
+/// Lens iteration order matches `step.lenses` order to keep
+/// downstream consumers deterministic.
+fn aggregate_lens_outputs(
+    step: &Step,
+    per_lens: &[(String, Map<String, Value>)],
+    strategy: Aggregate,
+) -> Map<String, Value> {
+    // Consolidate is dispatched via `Driver::consolidate` before
+    // this function gets called. Treat it as Concat so a future
+    // refactor calling this with Consolidate doesn't silently drop
+    // data.
+    let strategy = if matches!(strategy, Aggregate::Consolidate) {
+        Aggregate::Concat
+    } else {
+        strategy
+    };
+    let mut out = Map::new();
+    for key in step.outputs.keys() {
+        match strategy {
+            Aggregate::Concat => {
+                let all_arrays = per_lens
+                    .iter()
+                    .all(|(_, m)| matches!(m.get(key), Some(Value::Array(_))));
+                if all_arrays && !per_lens.is_empty() {
+                    let mut combined: Vec<Value> = Vec::new();
+                    for (lens_id, m) in per_lens {
+                        if let Some(Value::Array(a)) = m.get(key) {
+                            for v in a {
+                                // Tag each item with its source
+                                // lens so downstream consumers can
+                                // group/dedupe. Mirrors the kres
+                                // findings model where every
+                                // finding carries a `lens` field.
+                                let tagged = match v {
+                                    Value::Object(o) => {
+                                        let mut o = o.clone();
+                                        o.entry("lens".to_string())
+                                            .or_insert_with(|| Value::String(lens_id.clone()));
+                                        Value::Object(o)
+                                    }
+                                    other => Value::Object({
+                                        let mut o = Map::new();
+                                        o.insert("lens".into(), Value::String(lens_id.clone()));
+                                        o.insert("value".into(), other.clone());
+                                        o
+                                    }),
+                                };
+                                combined.push(tagged);
+                            }
+                        }
+                    }
+                    out.insert(key.clone(), Value::Array(combined));
+                } else {
+                    let mut pairs: Vec<Value> = Vec::new();
+                    for (lens_id, m) in per_lens {
+                        let mut o = Map::new();
+                        o.insert("lens".into(), Value::String(lens_id.clone()));
+                        o.insert("value".into(), m.get(key).cloned().unwrap_or(Value::Null));
+                        pairs.push(Value::Object(o));
+                    }
+                    out.insert(key.clone(), Value::Array(pairs));
+                }
+            }
+            Aggregate::ByLens => {
+                let mut by = Map::new();
+                for (lens_id, m) in per_lens {
+                    by.insert(lens_id.clone(), m.get(key).cloned().unwrap_or(Value::Null));
+                }
+                out.insert(key.clone(), Value::Object(by));
+            }
+            Aggregate::Consolidate => unreachable!("normalised to Concat above"),
+        }
+    }
+    out
+}
+
+/// Reset every step that depends_on `target` (transitively) so the
+/// graph re-runs them after the target re-completes.
+fn reset_dependents_preserving(
+    workflow: &Workflow,
+    state: &mut HashMap<String, StepState>,
+    target: &str,
+    preserve_outputs_for: Option<&str>,
+) {
+    let mut to_reset: Vec<String> = vec![target.to_string()];
+    let mut i = 0;
+    while i < to_reset.len() {
+        let cur = to_reset[i].clone();
+        i += 1;
+        for s in &workflow.steps {
+            if s.depends_on.iter().any(|d| d == &cur) && !to_reset.iter().any(|x| x == &s.id) {
+                to_reset.push(s.id.clone());
+            }
+        }
+    }
+    for id in to_reset {
+        if id == target {
+            continue;
+        }
+        if let Some(st) = state.get_mut(&id) {
+            // Only reset settled steps; don't disturb something
+            // that's still Pending/BranchedAway in flight.
+            if matches!(
+                st.status,
+                StepStatus::Done | StepStatus::Skipped | StepStatus::DoneWithFailure
+            ) {
+                st.status = StepStatus::Pending;
+                st.reuse_gathered_context = false;
+                let preserve_for_skip = workflow
+                    .steps
+                    .iter()
+                    .any(|s| s.id == id && s.preserve_outputs_on_skip);
+                if preserve_outputs_for == Some(id.as_str()) {
+                    st.preserved_outputs_on_skip.clear();
+                } else if preserve_for_skip {
+                    st.preserved_outputs_on_skip = std::mem::take(&mut st.outputs);
+                } else {
+                    // Snapshot non-empty outputs into prior_attempts
+                    // (matching reset_for_reentry's snapshot for the
+                    // branch target), so a later step that reads
+                    // `{{<id>.prior_attempts}}` can see the cycle's
+                    // values even when this step's live outputs were
+                    // cleared by the cascade. Keeping the snapshot in
+                    // prior_attempts (not in outputs) avoids retripping
+                    // downstream `run_if` expressions on the next pass.
+                    if !st.outputs.is_empty() {
+                        let snapshot = std::mem::take(&mut st.outputs);
+                        st.prior_attempts.push(snapshot);
+                    }
+                    st.preserved_outputs_on_skip.clear();
+                }
+            }
+        }
+    }
+}
+
+/// Scripted driver: returns outputs from a `(step_id, attempt)` →
+/// outputs table. Use `with(step, attempt, json!({...}))` to build.
+#[derive(Default)]
+pub struct ScriptedDriver {
+    table: BTreeMap<(String, u32), Map<String, Value>>,
+    fallback: Map<String, Value>,
+}
+
+impl ScriptedDriver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with(mut self, step_id: &str, attempt: u32, outputs: Value) -> Self {
+        let map = match outputs {
+            Value::Object(m) => m,
+            _ => panic!("ScriptedDriver outputs must be a JSON object"),
+        };
+        self.table.insert((step_id.to_string(), attempt), map);
+        self
+    }
+    /// Outputs returned for any (step, attempt) not in the table.
+    /// Default is an empty object — most steps without an eval just
+    /// need _something_ non-erroring.
+    pub fn default_output(mut self, outputs: Value) -> Self {
+        match outputs {
+            Value::Object(m) => self.fallback = m,
+            _ => panic!("default_output must be an object"),
+        }
+        self
+    }
+}
+
+#[async_trait]
+impl Driver for ScriptedDriver {
+    async fn run(
+        &self,
+        step: &Step,
+        attempt: u32,
+        _ctx: &ExecContext<'_>,
+        lens: Option<&Lens>,
+    ) -> Result<Map<String, Value>, DriverError> {
+        // Lensed lookup: tests script outputs by
+        // `(step_id|lens_id, attempt)` so each lens variant can
+        // produce its own outputs per attempt. Plain steps fall
+        // back to the bare `step_id` key.
+        let key_id = match lens {
+            Some(l) => format!("{}|{}", step.id, l.id),
+            None => step.id.clone(),
+        };
+        Ok(self
+            .table
+            .get(&(key_id, attempt))
+            .cloned()
+            .unwrap_or_else(|| self.fallback.clone()))
+    }
+
+    async fn consolidate(
+        &self,
+        step: &Step,
+        ctx: &ExecContext<'_>,
+        _per_lens: &[(String, Map<String, Value>)],
+    ) -> Result<Map<String, Value>, DriverError> {
+        // Consolidate phase scripted under `<step_id>|@consolidate`.
+        // Tests verify the executor invoked this method; the actual
+        // dedup logic is exercised separately in the LlmDriver
+        // tests.
+        let key = format!("{}|@consolidate", step.id);
+        let attempt = ctx.steps.get(&step.id).map(|s| s.attempt).unwrap_or(1);
+        Ok(self
+            .table
+            .get(&(key, attempt))
+            .cloned()
+            .unwrap_or_else(|| self.fallback.clone()))
+    }
+
+    async fn judge(&self, _step: &Step, _ctx: &ExecContext<'_>) -> Result<(bool, String), String> {
+        Ok((true, "scripted judge accepts".into()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Expression evaluator
+// ---------------------------------------------------------------------------
+
+pub mod expr {
+    use super::ExecContext;
+    use serde_json::Value;
+
+    /// Evaluate `src` against `ctx`. `current_step` is the step whose
+    /// outputs are visible via bare identifiers (no dot). Returns
+    /// the boolean result or a parser/runtime error string.
+    pub fn eval(src: &str, ctx: &ExecContext, current_step: Option<&str>) -> Result<bool, String> {
+        let toks = tokenize(src)?;
+        let mut p = Parser { toks, pos: 0 };
+        let expr = p.parse_or()?;
+        if p.pos != p.toks.len() {
+            return Err(format!("trailing tokens at pos {}", p.pos));
+        }
+        eval_expr(&expr, ctx, current_step)
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Token {
+        Ident(String),
+        Dot,
+        Op(Op),
+        And,
+        Or,
+        LParen,
+        RParen,
+        Str(String),
+        Int(i64),
+        Bool(bool),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Op {
+        Eq,
+        Neq,
+        Lt,
+        Le,
+        Gt,
+        Ge,
+    }
+
+    fn tokenize(s: &str) -> Result<Vec<Token>, String> {
+        let mut out = Vec::new();
+        let mut chars = s.chars().peekable();
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() {
+                chars.next();
+                continue;
+            }
+            if c.is_ascii_alphabetic() || c == '_' {
+                let mut s = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                        s.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                match s.as_str() {
+                    "true" => out.push(Token::Bool(true)),
+                    "false" => out.push(Token::Bool(false)),
+                    _ => out.push(Token::Ident(s)),
+                }
+                continue;
+            }
+            if c.is_ascii_digit() {
+                let mut s = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_digit() {
+                        s.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                out.push(Token::Int(s.parse().map_err(|e| format!("int: {e}"))?));
+                continue;
+            }
+            if c == '\'' {
+                chars.next();
+                let mut s = String::new();
+                let mut closed = false;
+                while let Some(&c) = chars.peek() {
+                    if c == '\'' {
+                        chars.next();
+                        closed = true;
+                        break;
+                    }
+                    s.push(c);
+                    chars.next();
+                }
+                if !closed {
+                    return Err("unterminated string".into());
+                }
+                out.push(Token::Str(s));
+                continue;
+            }
+            match c {
+                '.' => {
+                    chars.next();
+                    out.push(Token::Dot);
+                }
+                '(' => {
+                    chars.next();
+                    out.push(Token::LParen);
+                }
+                ')' => {
+                    chars.next();
+                    out.push(Token::RParen);
+                }
+                '&' => {
+                    chars.next();
+                    if chars.next() != Some('&') {
+                        return Err("expected '&&'".into());
+                    }
+                    out.push(Token::And);
+                }
+                '|' => {
+                    chars.next();
+                    if chars.next() != Some('|') {
+                        return Err("expected '||'".into());
+                    }
+                    out.push(Token::Or);
+                }
+                '=' => {
+                    chars.next();
+                    if chars.next() != Some('=') {
+                        return Err("expected '=='".into());
+                    }
+                    out.push(Token::Op(Op::Eq));
+                }
+                '!' => {
+                    chars.next();
+                    if chars.next() != Some('=') {
+                        return Err("expected '!='".into());
+                    }
+                    out.push(Token::Op(Op::Neq));
+                }
+                '<' => {
+                    chars.next();
+                    if chars.peek() == Some(&'=') {
+                        chars.next();
+                        out.push(Token::Op(Op::Le));
+                    } else {
+                        out.push(Token::Op(Op::Lt));
+                    }
+                }
+                '>' => {
+                    chars.next();
+                    if chars.peek() == Some(&'=') {
+                        chars.next();
+                        out.push(Token::Op(Op::Ge));
+                    } else {
+                        out.push(Token::Op(Op::Gt));
+                    }
+                }
+                _ => return Err(format!("unexpected char '{c}'")),
+            }
+        }
+        Ok(out)
+    }
+
+    #[derive(Debug, Clone)]
+    enum Expr {
+        Or(Box<Expr>, Box<Expr>),
+        And(Box<Expr>, Box<Expr>),
+        Cmp(Path, Op, Atom),
+    }
+
+    #[derive(Debug, Clone)]
+    struct Path(Vec<String>);
+
+    #[derive(Debug, Clone)]
+    enum Atom {
+        Path(Path),
+        Str(String),
+        Int(i64),
+        Bool(bool),
+    }
+
+    struct Parser {
+        toks: Vec<Token>,
+        pos: usize,
+    }
+
+    impl Parser {
+        fn peek(&self) -> Option<&Token> {
+            self.toks.get(self.pos)
+        }
+        fn next(&mut self) -> Option<Token> {
+            let t = self.toks.get(self.pos).cloned();
+            if t.is_some() {
+                self.pos += 1;
+            }
+            t
+        }
+
+        fn parse_or(&mut self) -> Result<Expr, String> {
+            let mut e = self.parse_and()?;
+            while matches!(self.peek(), Some(Token::Or)) {
+                self.next();
+                let r = self.parse_and()?;
+                e = Expr::Or(Box::new(e), Box::new(r));
+            }
+            Ok(e)
+        }
+        fn parse_and(&mut self) -> Result<Expr, String> {
+            let mut e = self.parse_cmp()?;
+            while matches!(self.peek(), Some(Token::And)) {
+                self.next();
+                let r = self.parse_cmp()?;
+                e = Expr::And(Box::new(e), Box::new(r));
+            }
+            Ok(e)
+        }
+        fn parse_cmp(&mut self) -> Result<Expr, String> {
+            if matches!(self.peek(), Some(Token::LParen)) {
+                self.next();
+                let inner = self.parse_or()?;
+                if !matches!(self.next(), Some(Token::RParen)) {
+                    return Err("expected ')'".into());
+                }
+                return Ok(inner);
+            }
+            let path = self.parse_path()?;
+            let op = match self.next() {
+                Some(Token::Op(o)) => o,
+                Some(t) => return Err(format!("expected comparison op, got {t:?}")),
+                None => return Err("expected comparison op".into()),
+            };
+            let rhs = self.parse_atom()?;
+            Ok(Expr::Cmp(path, op, rhs))
+        }
+        fn parse_path(&mut self) -> Result<Path, String> {
+            let mut parts = Vec::new();
+            match self.next() {
+                Some(Token::Ident(s)) => parts.push(s),
+                t => return Err(format!("expected ident, got {t:?}")),
+            }
+            while matches!(self.peek(), Some(Token::Dot)) {
+                self.next();
+                match self.next() {
+                    Some(Token::Ident(s)) => parts.push(s),
+                    t => return Err(format!("expected ident after '.', got {t:?}")),
+                }
+            }
+            Ok(Path(parts))
+        }
+        fn parse_atom(&mut self) -> Result<Atom, String> {
+            match self.next() {
+                Some(Token::Str(s)) => Ok(Atom::Str(s)),
+                Some(Token::Int(n)) => Ok(Atom::Int(n)),
+                Some(Token::Bool(b)) => Ok(Atom::Bool(b)),
+                Some(Token::Ident(s)) => {
+                    let mut parts = vec![s];
+                    while matches!(self.peek(), Some(Token::Dot)) {
+                        self.next();
+                        match self.next() {
+                            Some(Token::Ident(s)) => parts.push(s),
+                            t => return Err(format!("expected ident after '.', got {t:?}")),
+                        }
+                    }
+                    Ok(Atom::Path(Path(parts)))
+                }
+                t => Err(format!("expected literal or path, got {t:?}")),
+            }
+        }
+    }
+
+    fn eval_expr(e: &Expr, ctx: &ExecContext, current: Option<&str>) -> Result<bool, String> {
+        match e {
+            // Short-circuit `&&` and `||` so guarded checks like
+            // `step.attempt > 0 && step.result == 'X'` don't error
+            // when `step.result` is missing on a step that hasn't run
+            // (or whose outputs were cleared by a cascade reset). The
+            // attempt guard short-circuits the right side without
+            // evaluating it.
+            Expr::Or(a, b) => match eval_expr(a, ctx, current)? {
+                true => Ok(true),
+                false => eval_expr(b, ctx, current),
+            },
+            Expr::And(a, b) => match eval_expr(a, ctx, current)? {
+                false => Ok(false),
+                true => eval_expr(b, ctx, current),
+            },
+            Expr::Cmp(path, op, rhs) => {
+                let l = resolve(path, ctx, current)?;
+                let r = match rhs {
+                    Atom::Path(p) => resolve(p, ctx, current)?,
+                    Atom::Str(s) => Value::String(s.clone()),
+                    Atom::Int(n) => Value::Number((*n).into()),
+                    Atom::Bool(b) => Value::Bool(*b),
+                };
+                cmp(&l, *op, &r)
+            }
+        }
+    }
+
+    fn cmp(a: &Value, op: Op, b: &Value) -> Result<bool, String> {
+        // SQL-style NULL handling for Eq/Neq: when either side is
+        // Null (a step's output that hasn't been emitted, or was
+        // cleared by a cascade reset), both `==` and `!=` return
+        // false. A missing field is neither equal nor unequal to
+        // anything. Without this, `field != value` would return
+        // true on missing fields, which would fire completion's
+        // failure_when_any (e.g. `research_status != 'confirmed'`)
+        // before research even runs.
+        if (matches!(a, Value::Null) || matches!(b, Value::Null)) && matches!(op, Op::Eq | Op::Neq)
+        {
+            return Ok(false);
+        }
+        match op {
+            Op::Eq => Ok(values_eq(a, b)),
+            Op::Neq => Ok(!values_eq(a, b)),
+            Op::Lt | Op::Le | Op::Gt | Op::Ge => {
+                let ai = a
+                    .as_i64()
+                    .ok_or_else(|| format!("ordering needs int, got {a:?}"))?;
+                let bi = b
+                    .as_i64()
+                    .ok_or_else(|| format!("ordering needs int, got {b:?}"))?;
+                Ok(match op {
+                    Op::Lt => ai < bi,
+                    Op::Le => ai <= bi,
+                    Op::Gt => ai > bi,
+                    Op::Ge => ai >= bi,
+                    _ => unreachable!(),
+                })
+            }
+        }
+    }
+
+    fn values_eq(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::String(x), Value::String(y)) => x == y,
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
+            (Value::Null, Value::Null) => true,
+            _ => false,
+        }
+    }
+
+    fn resolve(path: &Path, ctx: &ExecContext, current: Option<&str>) -> Result<Value, String> {
+        let parts = &path.0;
+        if parts.is_empty() {
+            return Err("empty path".into());
+        }
+        if parts.len() == 1 {
+            // Bare ident — current step's StepState (attempt/
+            // eval_failures/prior_attempts) or declared outputs, with
+            // a workflow-input fallback. See StepState::lookup_field
+            // for the canonical lookup shared with workflow_runner.
+            let name = &parts[0];
+            if let Some(cur) = current {
+                if let Some(st) = ctx.steps.get(cur) {
+                    if let Some(v) = st.lookup_field(name) {
+                        return Ok(v);
+                    }
+                }
+            }
+            if let Some(v) = ctx.workflow_inputs.get(name) {
+                return Ok(v.clone());
+            }
+            return Err(format!(
+                "name '{name}' not bound in current step or workflow"
+            ));
+        }
+        if parts[0] == "workflow" {
+            let start = Value::Object(ctx.workflow_inputs.clone());
+            return super::walk_dotted_path(start, &parts[1..])
+                .map_err(|failing| format!("workflow.{failing} not found"));
+        }
+        let Some(st) = ctx.steps.get(&parts[0]) else {
+            if let Some(cur) = current {
+                if let Some(st) = ctx.steps.get(cur) {
+                    if let Some(start) = st.lookup_field(&parts[0]) {
+                        return super::walk_dotted_path(start, &parts[1..])
+                            .map_err(|failing| format!("{}.{} not found", parts[0], failing));
+                    }
+                }
+            }
+            return Err(format!("step '{}' not in context", parts[0]));
+        };
+        // A reference to a step's output field returns Null when the
+        // field isn't present. This is the difference between a typo
+        // (step name unknown → error) and an output that the step
+        // hasn't produced yet — or that a cascade reset cleared.
+        // Treating "no output" as Null lets `step.field == 'X'`
+        // evaluate to false instead of failing the workflow, so
+        // run_if expressions like `compile-triage.result == 'patch_error'`
+        // work both when compile-triage just emitted that result and
+        // when it was skipped on this cycle (build was clean).
+        let start = st.lookup_field(&parts[1]).unwrap_or(Value::Null);
+        super::walk_dotted_path(start, &parts[2..])
+            .map_err(|failing| format!("{}.{}.{failing} not found", parts[0], parts[1]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workflow::parse_workflow;
+    use serde_json::json;
+
+    fn fix_workflow() -> Workflow {
+        parse_workflow(include_str!("../../configs/workflows/fix.json")).unwrap()
+    }
+
+    fn series_assessment_context(
+        outputs: Value,
+    ) -> (Step, Map<String, Value>, HashMap<String, StepState>) {
+        let step = fix_workflow()
+            .steps
+            .into_iter()
+            .find(|step| step.id == "series-assessment")
+            .unwrap();
+        let mut inputs = Map::new();
+        inputs.insert(
+            "fix_series_state".into(),
+            json!({"original_bugs": [
+                {"id": "bug-a", "description": "a"},
+                {"id": "bug-b", "description": "b"}
+            ]}),
+        );
+        let mut steps = HashMap::new();
+        steps.insert(
+            step.id.clone(),
+            StepState {
+                outputs: outputs.as_object().unwrap().clone(),
+                ..StepState::default()
+            },
+        );
+        (step, inputs, steps)
+    }
+
+    fn validate_workflow() -> Workflow {
+        parse_workflow(include_str!("../../configs/workflows/validate.json")).unwrap()
+    }
+
+    fn validate_step(id: &str) -> Step {
+        validate_workflow()
+            .steps
+            .into_iter()
+            .find(|step| step.id == id)
+            .unwrap()
+    }
+
+    fn step_state(outputs: Value) -> StepState {
+        StepState {
+            outputs: outputs.as_object().unwrap().clone(),
+            ..StepState::default()
+        }
+    }
+
+    fn fresh_claim(id: &str, gating: bool, verdict: &str) -> Value {
+        json!({
+            "id": id,
+            "claim": "c",
+            "kind": "precondition",
+            "verdict": verdict,
+            "gating": gating,
+            "evidence": [{"location": "kernel/sched/fair.c:1809", "provenance": "fresh"}],
+            "source_needed": "the definition of update_avg_scale"
+        })
+    }
+
+    fn claims_output(claims: Value) -> Value {
+        json!({
+            "claim_validation": {
+                "schema_version": 1,
+                "thesis": "task_cache_work mutates sc_stat without the lock",
+                "claims": claims,
+                "design_intent": {"checked": true, "evidence": null},
+                "open_questions_to_close": [],
+                "false_positive_risks": []
+            }
+        })
+    }
+
+    fn run_claims_eval(outputs: Value) -> (bool, Option<String>) {
+        let step = validate_step("validate-claims");
+        let inputs = Map::new();
+        let mut steps = HashMap::new();
+        steps.insert(step.id.clone(), step_state(outputs));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        eval_validate_claims_wellformed(&step, &ctx)
+    }
+
+    /// Drive `reconcile_covers_every_defect` with `defect_count`
+    /// review defects and the given reconciliation outputs.
+    fn run_reconcile_eval(defect_count: usize, outputs: Value) -> (bool, Option<String>) {
+        let step = fix_workflow()
+            .steps
+            .into_iter()
+            .find(|step| step.id == "reconcile-review")
+            .unwrap();
+        let defects: Vec<Value> = (0..defect_count)
+            .map(|i| json!({"lens": "maintainer", "where": "a.c:1", "what": format!("d{i}")}))
+            .collect();
+        let inputs = Map::new();
+        let mut steps = HashMap::new();
+        steps.insert(
+            "review".to_string(),
+            step_state(json!({"defects": defects})),
+        );
+        steps.insert(step.id.clone(), step_state(outputs));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        eval_reconcile_covers_every_defect(&step, &ctx)
+    }
+
+    fn instruction(covers: Vec<i64>) -> Value {
+        instruction_of_kind(covers, "behavior")
+    }
+
+    fn instruction_of_kind(covers: Vec<i64>, kind: &str) -> Value {
+        json!({"covers": covers, "target": "source", "kind": kind, "where": "a.c:1",
+               "do": "fix it", "why": "a.c:1 is wrong"})
+    }
+
+    #[test]
+    fn reconcile_eval_accepts_full_coverage_including_a_merge() {
+        // Two lenses reporting the same problem merge into one
+        // instruction covering both indices — the point of the step.
+        assert_eq!(
+            run_reconcile_eval(
+                3,
+                json!({"instructions": [instruction(vec![0, 2])],
+                                         "dropped": [{"covers": [1], "reason": "disproved at a.c:9"}]})
+            ),
+            (true, None)
+        );
+    }
+
+    #[test]
+    fn reconcile_eval_rejects_a_silently_dropped_defect() {
+        let (ok, reason) =
+            run_reconcile_eval(3, json!({"instructions": [instruction(vec![0, 1])]}));
+        assert!(!ok);
+        let reason = reason.unwrap();
+        assert!(
+            reason.contains("#2"),
+            "must name the abandoned defect: {reason}"
+        );
+        assert!(reason.contains("neither instructions[].covers nor dropped[].covers"));
+    }
+
+    /// The prompt tells the model each defect appears in exactly one
+    /// of the two arrays. Instructing on a defect AND recording it as
+    /// dropped is a contradiction, not a merge.
+    #[test]
+    fn reconcile_eval_rejects_a_defect_that_is_both_instructed_and_dropped() {
+        let (ok, reason) = run_reconcile_eval(
+            2,
+            json!({"instructions": [instruction(vec![0, 1])],
+                   "dropped": [{"covers": [1], "reason": "disproved at a.c:9"}]}),
+        );
+        assert!(!ok);
+        let reason = reason.unwrap();
+        assert!(
+            reason.contains("[1]"),
+            "must name the contradictory index: {reason}"
+        );
+        assert!(reason.contains("not both"));
+    }
+
+    /// The shape that slipped through on the 2026-08-10 linux.nfs run:
+    /// the reviewer says the code performs no permission check, and the
+    #[test]
+    fn reconcile_eval_accepts_a_dropped_defect_without_a_behaviour_instruction() {
+        assert_eq!(
+            run_reconcile_eval(
+                1,
+                json!({"dropped": [{"covers": [0], "reason": "out of contract per the fix todo"}]}),
+            ),
+            (true, None)
+        );
+    }
+
+    /// The store must outlive the cascade that resets its author.
+    ///
+    /// `reset_dependents_preserving` preserves only the BRANCHING
+    /// step's outputs, so a worker reached by an orchestrator branch
+    /// sees `orchestrator.instruction` but NOT the reconciliation
+    /// pass's own outputs -- it is a transitive dependent of the
+    /// worker and gets cleared on the way back. Measured on the
+    /// 2026-08-10 linux.nfs run, all eight write-patch prompts
+    /// rendered the reconciled instruction block with an empty array,
+    /// so the whole step was writing into the void.
+    #[test]
+    fn steering_fields_survive_the_cascade_that_clears_their_author() {
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "cascade-test",
+            "steps": [
+                {"id": "write-patch", "agent": "fast", "prompt": "p"},
+                {"id": "review", "agent": "fast", "prompt": "p", "depends_on": ["write-patch"]},
+                {"id": "reconcile-review", "agent": "slow", "prompt": "p",
+                 "depends_on": ["review"],
+                 "outputs": {"objectives": {"type": "array<object>"}}}
+            ]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+
+        let mut state = HashMap::new();
+        for id in ["write-patch", "review", "reconcile-review"] {
+            state.insert(
+                id.to_string(),
+                StepState {
+                    id: id.to_string(),
+                    status: StepStatus::Done,
+                    ..Default::default()
+                },
+            );
+        }
+        merge_emitted_objectives(
+            &mut state,
+            json!({"objectives": [open_objective("O1")],
+                   "must_fix": "O1",
+                   "instructions": [{"covers": [0]}]})
+            .as_object()
+            .unwrap(),
+        );
+        // The pass's own outputs, as the executor would have stored them.
+        state.get_mut("reconcile-review").unwrap().outputs =
+            json!({"objectives": [open_objective("O1")], "must_fix": "O1"})
+                .as_object()
+                .unwrap()
+                .clone();
+
+        // Orchestrator routes back to write-patch.
+        reset_for_reentry(&mut state, "write-patch");
+        reset_dependents_preserving(&wf, &mut state, "write-patch", None);
+
+        assert!(
+            state["reconcile-review"].outputs.is_empty(),
+            "the cascade is expected to clear the author's outputs"
+        );
+        let store = &state[OBJECTIVES_STEP_ID].outputs;
+        assert_eq!(
+            store["must_fix"],
+            json!("O1"),
+            "must_fix must reach the worker"
+        );
+        assert_eq!(store["instructions"][0]["covers"], json!([0]));
+        assert_eq!(store["list"][0]["id"], json!("O1"));
+    }
+
+    /// Ages are Rust's, and omission does not retire an objective.
+    #[test]
+    fn merging_objectives_stamps_age_and_carries_the_unmentioned_forward() {
+        let mut state = HashMap::new();
+        // Round 1: two objectives raised.
+        merge_emitted_objectives(
+            &mut state,
+            json!({"objectives": [open_objective("O1"), open_objective("O2")]})
+                .as_object()
+                .unwrap(),
+        );
+        // Round 2: the pass re-emits only O1, and tries to tell us how
+        // old it is. Both claims are ignored.
+        let mut lying = open_objective("O1");
+        lying["first_round"] = json!(99);
+        lying["rounds_open"] = json!(1);
+        merge_emitted_objectives(
+            &mut state,
+            json!({"objectives": [lying], "must_fix": "O1"})
+                .as_object()
+                .unwrap(),
+        );
+
+        let store = &state[OBJECTIVES_STEP_ID].outputs;
+        assert_eq!(store["round"], json!(2));
+        let list = store["list"].as_array().unwrap();
+        assert_eq!(list.len(), 2, "an unmentioned objective is not deleted");
+
+        let o1 = list.iter().find(|o| o["id"] == json!("O1")).unwrap();
+        assert_eq!(o1["first_round"], json!(1), "Rust keeps the original round");
+        assert_eq!(o1["rounds_open"], json!(2), "and recomputes the age itself");
+
+        // O2 went unmentioned: carried forward at its round-1 age,
+        // still there to be answered for.
+        let o2 = list.iter().find(|o| o["id"] == json!("O2")).unwrap();
+        assert_eq!(o2["first_round"], json!(1));
+
+        // The steering fields ride the store, not the step, because
+        // the step's outputs are cleared by the cascade before a
+        // worker ever reads them.
+        assert_eq!(store["must_fix"], json!("O1"));
+    }
+
+    /// Drive the escalation rule with a store that already holds
+    /// `held` (as Rust would have stamped it) and a pass emitting
+    /// `emitted`.
+    fn run_escalation_eval(held: Value, emitted: Value) -> (bool, Option<String>) {
+        let step = fix_workflow()
+            .steps
+            .into_iter()
+            .find(|step| step.id == "reconcile-review")
+            .unwrap();
+        let inputs = Map::new();
+        let mut steps = HashMap::new();
+        steps.insert(
+            OBJECTIVES_STEP_ID.to_string(),
+            step_state(json!({"round": 2, "list": held})),
+        );
+        steps.insert(step.id.clone(), step_state(emitted));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        stale_objectives_are_escalated(&step, &ctx)
+    }
+
+    fn open_objective(id: &str) -> Value {
+        json!({"id": id, "statement": "call may_open() on the fallback", "status": "open"})
+    }
+
+    /// The 2026-08-10 linux.nfs shape: the same objective re-emitted
+    /// as open, round after round, with no commitment to landing it.
+    #[test]
+    fn escalation_eval_rejects_reasking_for_a_stale_objective() {
+        let (ok, reason) = run_escalation_eval(
+            json!([{"id": "O1", "rounds_open": 2}]),
+            json!({"objectives": [open_objective("O1")], "must_fix": ""}),
+        );
+        assert!(!ok);
+        let reason = reason.unwrap();
+        assert!(
+            reason.contains("O1"),
+            "must name the stale objective: {reason}"
+        );
+        assert!(reason.contains("must_fix"));
+    }
+
+    #[test]
+    fn escalation_eval_accepts_committing_to_the_stale_objective() {
+        assert_eq!(
+            run_escalation_eval(
+                json!([{"id": "O1", "rounds_open": 2}]),
+                json!({"objectives": [open_objective("O1")], "must_fix": "O1"}),
+            ),
+            (true, None)
+        );
+    }
+
+    /// Settling the objective is the other way to clear the rule.
+    #[test]
+    fn escalation_eval_accepts_settling_the_stale_objective() {
+        for status in ["satisfied", "withdrawn"] {
+            let mut objective = open_objective("O1");
+            objective["status"] = json!(status);
+            objective["evidence"] = json!("fs/namei.c:5099 now calls may_open()");
+            assert_eq!(
+                run_escalation_eval(
+                    json!([{"id": "O1", "rounds_open": 3}]),
+                    json!({"objectives": [objective], "must_fix": ""}),
+                ),
+                (true, None),
+                "{status} should settle a stale objective"
+            );
+        }
+    }
+
+    /// The orchestrator must be able to reach the commit-message
+    /// worker even when this cycle's write-patch produced nothing.
+    ///
+    /// On the 2026-08-11 08:01 linux.mm run the orchestrator routed to
+    /// write-patch, write-patch emitted no edits, and
+    /// `code_changes_emitted` went false — which closed
+    /// write-commit-message's gate for the rest of the run. The
+    /// orchestrator wanted a commit-message fix for a must_fix
+    /// objective, got the step skipped every time, fell back to
+    /// write-patch, and exhausted its ten attempts having run neither
+    /// worker to effect. write-patch even started editing
+    /// `.kres-commit-msg.tmp` through code_edits.
+    #[test]
+    fn orchestrator_can_reach_the_commit_message_worker_after_an_empty_patch() {
+        let wf = fix_workflow();
+        let step = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "write-commit-message")
+            .unwrap();
+        let run_if = step
+            .run_if
+            .as_deref()
+            .expect("write-commit-message gates itself");
+
+        let inputs = Map::new();
+        let state = |emitted: bool, next: &str| {
+            HashMap::from([
+                (
+                    "research".to_string(),
+                    step_state(json!({"research_status": "confirmed"})),
+                ),
+                (
+                    "write-patch".to_string(),
+                    step_state(json!({"code_changes_emitted": emitted, "review_dispute": ""})),
+                ),
+                (
+                    "orchestrator".to_string(),
+                    step_state(json!({"next_step": next})),
+                ),
+            ])
+        };
+        let run = |steps: &HashMap<String, StepState>| {
+            expr::eval(
+                run_if,
+                &ExecContext {
+                    workflow_inputs: &inputs,
+                    steps,
+                },
+                Some("write-commit-message"),
+            )
+            .unwrap()
+        };
+
+        // The livelock: write-patch produced nothing, and the
+        // orchestrator is explicitly asking for the changelog worker.
+        assert!(
+            run(&state(false, "write-commit-message")),
+            "an explicit orchestrator routing must open the gate"
+        );
+        // Normal first pass: the patch landed, no routing yet.
+        assert!(run(&state(true, "")));
+        // Still closed when nothing was patched and nobody asked.
+        assert!(!run(&state(false, "")));
+    }
+
+    /// A stale objective must not escape the rule on a round whose own
+    /// defect list happens to be empty. Objectives outlive rounds; the
+    /// early return for "no defects this cycle" used to skip
+    /// escalation entirely.
+    #[test]
+    fn escalation_still_applies_when_this_round_reported_no_defects() {
+        let step = fix_workflow()
+            .steps
+            .into_iter()
+            .find(|step| step.id == "reconcile-review")
+            .unwrap();
+        let inputs = Map::new();
+        let mut steps = HashMap::new();
+        steps.insert("review".to_string(), step_state(json!({"defects": []})));
+        steps.insert(
+            OBJECTIVES_STEP_ID.to_string(),
+            step_state(json!({"round": 3, "list": [{"id": "O1", "rounds_open": 3}]})),
+        );
+        steps.insert(
+            step.id.clone(),
+            step_state(json!({"objectives": [open_objective("O1")], "must_fix": ""})),
+        );
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        let (ok, reason) = eval_reconcile_covers_every_defect(&step, &ctx);
+        assert!(
+            !ok,
+            "a 3-round-old objective slipped through a defect-free round"
+        );
+        assert!(reason.unwrap().contains("O1"));
+    }
+
+    /// A first-round objective is not stale: the loop has not yet had
+    /// a chance to act on it.
+    #[test]
+    fn escalation_eval_leaves_a_fresh_objective_alone() {
+        assert_eq!(
+            run_escalation_eval(
+                json!([]),
+                json!({"objectives": [open_objective("O2")], "must_fix": ""}),
+            ),
+            (true, None)
+        );
+    }
+
+    /// Committing to one stale objective is enough; the others are
+    /// explicitly waiting on it, which is the point of `must_fix`.
+    #[test]
+    fn escalation_eval_accepts_one_commitment_among_several_stale() {
+        assert_eq!(
+            run_escalation_eval(
+                json!([{"id": "O1", "rounds_open": 4}, {"id": "O2", "rounds_open": 2}]),
+                json!({"objectives": [open_objective("O1"), open_objective("O2")],
+                       "must_fix": "O2"}),
+            ),
+            (true, None)
+        );
+    }
+
+    #[test]
+    fn reconcile_eval_rejects_an_out_of_range_index() {
+        let (ok, reason) =
+            run_reconcile_eval(2, json!({"instructions": [instruction(vec![0, 1, 7])]}));
+        assert!(!ok);
+        assert!(reason.unwrap().contains("[7]"));
+    }
+
+    /// An instruction tied to no numbered defect is legitimate extra
+    /// work; only a `dropped` entry naming nothing is vacuous.
+    #[test]
+    fn reconcile_eval_allows_an_instruction_that_covers_no_numbered_defect() {
+        assert_eq!(
+            run_reconcile_eval(
+                1,
+                json!({"instructions": [instruction(vec![0]), instruction(vec![])]}),
+            ),
+            (true, None)
+        );
+    }
+
+    #[test]
+    fn reconcile_eval_rejects_a_dropped_entry_that_names_no_defect() {
+        let (ok, reason) = run_reconcile_eval(
+            1,
+            json!({"instructions": [instruction(vec![0])],
+                   "dropped": [{"covers": [], "reason": "out of scope"}]}),
+        );
+        assert!(!ok);
+        assert!(reason
+            .unwrap()
+            .contains("name the defect index this entry abandons"));
+    }
+
+    /// A clean review has nothing to reconcile, so the step is
+    /// vacuously satisfied rather than failing for lack of output.
+    #[test]
+    fn reconcile_eval_passes_when_the_review_reported_nothing() {
+        assert_eq!(run_reconcile_eval(0, json!({})), (true, None));
+    }
+
+    #[test]
+    fn claims_eval_accepts_a_well_formed_report() {
+        assert_eq!(
+            run_claims_eval(claims_output(json!([fresh_claim("a", true, "supported")]))),
+            (true, None)
+        );
+    }
+
+    /// A validation pass that confirms a gating claim using only text
+    /// the finding pasted into itself has verified nothing. The fast
+    /// agent has been observed noticing this and filing the claim
+    /// anyway, so it is checked here rather than asked for.
+    #[test]
+    fn claims_eval_rejects_a_gating_claim_supported_only_by_the_finding_quoting_itself() {
+        let mut claim = fresh_claim("quoted", true, "supported");
+        claim["evidence"] = json!([{
+            "location": "FINDING.md",
+            "provenance": "finding_quoted"
+        }]);
+        let (passed, reason) = run_claims_eval(claims_output(json!([claim])));
+        assert!(!passed);
+        assert!(reason.unwrap().contains("quoted"));
+
+        // The same evidence on a NON-gating claim is fine: it does not
+        // decide whether the bug exists.
+        let mut claim = fresh_claim("quoted", false, "supported");
+        claim["evidence"] = json!([{
+            "location": "FINDING.md",
+            "provenance": "finding_quoted"
+        }]);
+        assert!(run_claims_eval(claims_output(json!([claim]))).0);
+
+        // And one fresh citation alongside the quote is enough.
+        let mut claim = fresh_claim("mixed", true, "supported");
+        claim["evidence"] = json!([
+            {"location": "FINDING.md", "provenance": "finding_quoted"},
+            {"location": "kernel/sched/fair.c:1809", "provenance": "fresh"}
+        ]);
+        assert!(run_claims_eval(claims_output(json!([claim]))).0);
+    }
+
+    #[test]
+    fn claims_eval_rejects_unresolvable_and_unbacked_citations() {
+        let mut outputs = claims_output(json!([fresh_claim("a", true, "supported")]));
+        outputs["citation_check"] = json!({
+            "citations_checked": 1,
+            "unresolved": ["a: kernel/sched/fair.c:99999 is past end of file (12000 lines)"],
+            "unbacked_fresh": []
+        });
+        let (passed, reason) = run_claims_eval(outputs);
+        assert!(!passed);
+        assert!(reason.unwrap().contains("do not resolve"));
+
+        // An unbacked `fresh` label is logged, not fatal: replayed over
+        // 113 real reports it fired on correct claims whose evidence
+        // came from a grep, because grep results carry no filename.
+        let mut outputs = claims_output(json!([fresh_claim("a", true, "supported")]));
+        outputs["citation_check"] = json!({
+            "citations_checked": 1,
+            "unresolved": [],
+            "unbacked_fresh": ["a: kernel/sched/fair.c:1809 is marked fresh but ... never fetched"]
+        });
+        assert!(run_claims_eval(outputs).0);
+
+        // Clean lint passes.
+        let mut outputs = claims_output(json!([fresh_claim("a", true, "supported")]));
+        outputs["citation_check"] =
+            json!({"citations_checked": 3, "unresolved": [], "unbacked_fresh": []});
+        assert!(run_claims_eval(outputs).0);
+    }
+
+    #[test]
+    fn claims_eval_requires_the_intentional_design_check_and_a_thesis() {
+        let mut outputs = claims_output(json!([fresh_claim("a", true, "supported")]));
+        outputs["claim_validation"]["design_intent"] = json!({"checked": false, "evidence": null});
+        let (passed, reason) = run_claims_eval(outputs);
+        assert!(!passed);
+        assert!(reason.unwrap().contains("design_intent"));
+
+        let mut outputs = claims_output(json!([fresh_claim("a", true, "supported")]));
+        outputs["claim_validation"]["thesis"] = json!("   ");
+        assert!(!run_claims_eval(outputs).0);
+    }
+
+    #[test]
+    fn claims_eval_rejects_unevidenced_and_duplicate_and_vague_claims() {
+        let mut claim = fresh_claim("a", false, "supported");
+        claim["evidence"] = json!([]);
+        assert!(!run_claims_eval(claims_output(json!([claim]))).0);
+
+        let mut claim = fresh_claim("a", true, "unresolved");
+        claim["source_needed"] = json!("");
+        let (passed, reason) = run_claims_eval(claims_output(json!([claim])));
+        assert!(!passed);
+        assert!(reason.unwrap().contains("source_needed"));
+
+        let dupe = json!([
+            fresh_claim("same", false, "supported"),
+            fresh_claim("same", false, "supported")
+        ]);
+        assert!(!run_claims_eval(claims_output(dupe)).0);
+    }
+
+    struct VerdictCase {
+        verdict: &'static str,
+        claims: Value,
+        conjunction: Value,
+        extra: Value,
+    }
+
+    impl Default for VerdictCase {
+        fn default() -> Self {
+            Self {
+                verdict: "Plausible",
+                claims: json!([fresh_claim("a", true, "supported")]),
+                conjunction: json!({
+                    "schema_version": 1,
+                    "consistent": true,
+                    "conflicts": [],
+                    "single_execution_witness": {
+                        "build_config": [],
+                        "runtime_state": [],
+                        "call_site": "kernel/sched/fair.c:1900",
+                        "concurrent_writer": "task_tick_cache"
+                    },
+                    "witness_reasoning": "both hold on the tick path"
+                }),
+                extra: json!({}),
+            }
+        }
+    }
+
+    fn run_verdict_eval(case: VerdictCase) -> (bool, Option<String>) {
+        let step = validate_step("validate-reachability");
+        let mut outputs = json!({
+            "verdict": case.verdict,
+            "severity": "medium",
+            "summary_written": true,
+            "severity_written": true,
+            "triage_coding": {
+                "schema_version": 1,
+                "severity": "medium",
+                "summary_status": match case.verdict {
+                    "Plausible" => "plausible",
+                    "Invalid" => "invalid",
+                    "Unconfirmed" => "unconfirmed",
+                    "ConfirmedLatent" => "confirmed_latent",
+                    "NotADefect" => "not_a_defect",
+                    "Fixed" => "fixed",
+                    _ => "unknown",
+                }
+            }
+        });
+        for (k, v) in case.extra.as_object().unwrap() {
+            outputs[k] = v.clone();
+        }
+        let inputs = Map::new();
+        let mut steps = HashMap::new();
+        steps.insert(step.id.clone(), step_state(outputs));
+        steps.insert(
+            "validate-claims".to_string(),
+            step_state(claims_output(case.claims)),
+        );
+        steps.insert(
+            "validate-conjunction".to_string(),
+            step_state(json!({"conjunction": case.conjunction})),
+        );
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        eval_validate_verdict_consistency(&step, &ctx)
+    }
+
+    #[test]
+    fn verdict_eval_accepts_a_plausible_finding_that_stood_up() {
+        assert_eq!(run_verdict_eval(VerdictCase::default()), (true, None));
+    }
+
+    /// The slow prompt already said not to keep a finding Plausible with
+    /// an unresolved load-bearing claim. Runs preserved findings anyway
+    /// by recasting the claim as "a probability/severity question, not
+    /// an existence question". Prompt text the same model can talk
+    /// itself out of is not a control.
+    #[test]
+    fn verdict_eval_caps_plausible_when_a_gating_claim_is_unresolved() {
+        let (passed, reason) = run_verdict_eval(VerdictCase {
+            claims: json!([fresh_claim("gate", true, "unresolved")]),
+            ..Default::default()
+        });
+        assert!(!passed);
+        assert!(reason.unwrap().contains("gate"));
+
+        // Settling it here with evidence is the one way through.
+        assert!(
+            run_verdict_eval(VerdictCase {
+                claims: json!([fresh_claim("gate", true, "unresolved")]),
+                extra: json!({
+                    "gating_override": [
+                        {"claim_id": "gate", "evidence": "kernel/sched/fair.c:1756 takes the lock"}
+                    ]
+                }),
+                ..Default::default()
+            })
+            .0
+        );
+
+        // An override with no evidence is not an override.
+        assert!(
+            !run_verdict_eval(VerdictCase {
+                claims: json!([fresh_claim("gate", true, "unresolved")]),
+                extra: json!({"gating_override": [{"claim_id": "gate", "evidence": "  "}]}),
+                ..Default::default()
+            })
+            .0
+        );
+
+        // A NON-gating unresolved claim never blocked anything.
+        assert!(
+            run_verdict_eval(VerdictCase {
+                claims: json!([fresh_claim("detail", false, "unresolved")]),
+                ..Default::default()
+            })
+            .0
+        );
+
+        // And a verdict below Plausible is always allowed to carry open
+        // questions — that is what those verdicts mean.
+        assert!(
+            run_verdict_eval(VerdictCase {
+                verdict: "Unconfirmed",
+                claims: json!([fresh_claim("gate", true, "unresolved")]),
+                ..Default::default()
+            })
+            .0
+        );
+    }
+
+    /// Two individually-true claims whose conjunction is empty made the
+    /// finding impossible; nothing in the old flow ever put them side by
+    /// side.
+    #[test]
+    fn verdict_eval_caps_plausible_on_an_unaddressed_conflict() {
+        let mut conjunction = VerdictCase::default().conjunction;
+        conjunction["consistent"] = json!(false);
+        conjunction["conflicts"] = json!([{
+            "a_id": "core_off",
+            "b_id": "core_on",
+            "why": "the leak needs core scheduling off and the reader needs it on"
+        }]);
+
+        let (passed, reason) = run_verdict_eval(VerdictCase {
+            conjunction: conjunction.clone(),
+            ..Default::default()
+        });
+        assert!(!passed);
+        assert!(reason.unwrap().contains("core_off/core_on"));
+
+        // Resolving it with evidence clears the block, in either order.
+        assert!(
+            run_verdict_eval(VerdictCase {
+                conjunction: conjunction.clone(),
+                extra: json!({"conflict_resolution": [{
+                    "a_id": "core_on",
+                    "b_id": "core_off",
+                    "resolution": "the reader also runs on the non-core path",
+                    "evidence": "kernel/sched/core.c:190"
+                }]}),
+                ..Default::default()
+            })
+            .0
+        );
+    }
+
+    /// "Plausible" claims the bad path executes. If nobody can name one
+    /// configuration where it does, that claim is unsupported.
+    #[test]
+    fn verdict_eval_requires_a_witness_for_plausible() {
+        let mut conjunction = VerdictCase::default().conjunction;
+        conjunction["single_execution_witness"] = Value::Null;
+
+        let (passed, reason) = run_verdict_eval(VerdictCase {
+            conjunction: conjunction.clone(),
+            ..Default::default()
+        });
+        assert!(!passed);
+        assert!(reason.unwrap().contains("no execution witness"));
+
+        // The verdict step has fetched source the conjunction step did
+        // not, so it may establish the witness itself. Without this
+        // channel the eval demanded something the step had no field to
+        // emit: one run resolved both conflicts, was told three times to
+        // "supply the witness", and died with no way to comply.
+        assert!(
+            !run_verdict_eval_with(
+                VerdictCase {
+                    conjunction: conjunction.clone(),
+                    ..Default::default()
+                },
+                Vec::new(),
+                Value::Null,
+            )
+            .0
+        );
+        let step = validate_step("validate-reachability");
+        assert!(
+            step.outputs.contains_key("execution_witness"),
+            "the verdict step needs a channel to supply a witness"
+        );
+
+        // A witness with no call site is not a witness. The schema
+        // permits an empty string, and "nobody could name a place this
+        // fires" is exactly what the check exists to catch.
+        let mut siteless = VerdictCase::default().conjunction;
+        siteless["single_execution_witness"]["call_site"] = json!("  ");
+        assert!(
+            !run_verdict_eval(VerdictCase {
+                conjunction: siteless,
+                ..Default::default()
+            })
+            .0
+        );
+
+        // Supplying it clears the block.
+        let mut steps = HashMap::new();
+        let inputs = Map::new();
+        steps.insert(
+            step.id.clone(),
+            step_state(json!({
+                "verdict": "Plausible",
+                "severity": "medium",
+                "summary_written": true,
+                "severity_written": true,
+                "execution_witness": {
+                    "build_config": [],
+                    "runtime_state": ["cpuset_mutex not held on the setscheduler arm"],
+                    "call_site": "kernel/sched/syscalls.c:800",
+                    "concurrent_writer": "cpuset_write_resmask"
+                },
+                "triage_coding": {
+                    "schema_version": 1, "severity": "medium", "summary_status": "plausible"
+                }
+            })),
+        );
+        steps.insert(
+            "validate-claims".to_string(),
+            step_state(claims_output(json!([fresh_claim("a", true, "supported")]))),
+        );
+        steps.insert(
+            "validate-conjunction".to_string(),
+            step_state(json!({"conjunction": conjunction})),
+        );
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        assert_eq!(eval_validate_verdict_consistency(&step, &ctx), (true, None));
+
+        // ConfirmedLatent is exactly the verdict for a real structure
+        // with no current trigger, so it is not blocked by this.
+        assert!(
+            run_verdict_eval(VerdictCase {
+                verdict: "ConfirmedLatent",
+                conjunction,
+                ..Default::default()
+            })
+            .0
+        );
+    }
+
+    fn refuted(id: &str, refuted: bool) -> (String, StepState) {
+        (
+            id.to_string(),
+            step_state(json!({
+                "refutation": {
+                    "schema_version": 1,
+                    "refuted": refuted,
+                    "reasoning": "r",
+                    "weakest_link": "gate"
+                }
+            })),
+        )
+    }
+
+    fn run_verdict_eval_with(
+        case: VerdictCase,
+        refuters: Vec<(String, StepState)>,
+        rebuttals: Value,
+    ) -> (bool, Option<String>) {
+        let step = validate_step("validate-reachability");
+        let mut outputs = json!({
+            "verdict": case.verdict,
+            "severity": "medium",
+            "summary_written": true,
+            "severity_written": true,
+            "triage_coding": {
+                "schema_version": 1, "severity": "medium",
+                "summary_status": if case.verdict == "Plausible" { "plausible" } else { "unconfirmed" }
+            }
+        });
+        if !rebuttals.is_null() {
+            outputs["refutation_rebuttal"] = rebuttals;
+        }
+        let inputs = Map::new();
+        let mut steps = HashMap::new();
+        steps.insert(step.id.clone(), step_state(outputs));
+        steps.insert(
+            "validate-claims".to_string(),
+            step_state(claims_output(case.claims)),
+        );
+        steps.insert(
+            "validate-conjunction".to_string(),
+            step_state(json!({"conjunction": case.conjunction})),
+        );
+        steps.extend(refuters);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        eval_validate_verdict_consistency(&step, &ctx)
+    }
+
+    /// Either refuter breaking the finding is enough to block Plausible.
+    /// They are asked to break it, not to vote: a refutation carries
+    /// evidence and a survival does not, so a single successful one is
+    /// the stronger signal.
+    /// `&&` binds tighter than `||`, so a guard appended to an
+    /// alternation only covers its last branch. The secondary refuter's
+    /// run_if was written that way and the availability guard silently
+    /// applied to ConfirmedLatent only, letting the step run with no
+    /// second model configured -- which routes it back to the primary
+    /// and makes the second opinion the first one repeated.
+    /// Concurrent snapshot writes to one directory must not destroy
+    /// each other's scratch file.
+    ///
+    /// scripts/validate-all.py runs 50 kres processes with no
+    /// --results, so all of them fell back to one
+    /// <workspace>/.kres/workflow-state and wrote the same
+    /// workflow-validate.json.tmp. One renamed it away while another
+    /// was mid-write and the loser died with ENOENT -- twice in a
+    /// 113-finding batch. The scratch name is now unique per call, so
+    /// the failure is impossible rather than unlikely.
+    #[test]
+    fn concurrent_snapshot_saves_to_one_directory_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let errors: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|i| {
+                    let path = path.clone();
+                    scope.spawn(move || {
+                        let snap = WorkflowSnapshot {
+                            schema_version: WorkflowSnapshot::SCHEMA_VERSION,
+                            // Same id on purpose: that is what made the
+                            // target and the scratch file collide.
+                            workflow_id: "validate".to_string(),
+                            inputs: Map::new(),
+                            steps: vec![StepState {
+                                id: format!("step-{i}"),
+                                ..Default::default()
+                            }],
+                            events_count: i,
+                        };
+                        // Several writes each, to widen the window.
+                        (0..8)
+                            .filter_map(|_| snap.save(&path).err().map(|e| e.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        assert!(errors.is_empty(), "concurrent saves failed: {errors:?}");
+
+        // No scratch files survive, and the target is one valid
+        // document rather than two interleaved ones.
+        let leftovers: Vec<_> = std::fs::read_dir(&path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "scratch files left behind: {leftovers:?}"
+        );
+        let body = std::fs::read_to_string(path.join("workflow-validate.json")).unwrap();
+        serde_json::from_str::<WorkflowSnapshot>(&body).expect("target is a whole document");
+    }
+
+    /// A step whose branch points back at itself must not record the
+    /// attempt twice. `branch_to_output` resolves its target from the
+    /// step's own outputs, so naming itself is reachable, and
+    /// reset_for_reentry already snapshots the target.
+    #[test]
+    fn a_self_branch_records_one_attempt_not_two() {
+        let mut state: HashMap<String, StepState> = HashMap::new();
+        state.insert(
+            "s".into(),
+            StepState {
+                id: "s".into(),
+                status: StepStatus::Done,
+                outputs: json!({"next_step": "s"}).as_object().unwrap().clone(),
+                ..Default::default()
+            },
+        );
+        // The guard in the BranchTo arm: skip when target == step.id.
+        let target = "s";
+        let step_id = "s";
+        if target != step_id {
+            let src = state.get_mut(step_id).unwrap();
+            let rejected = src.outputs.clone();
+            src.prior_attempts.push(rejected);
+        }
+        reset_for_reentry(&mut state, target);
+        assert_eq!(state["s"].prior_attempts.len(), 1);
+    }
+
+    /// A step that branches away keeps a record of what it said.
+    ///
+    /// Repeat and reset_for_reentry both snapshot a rejected attempt,
+    /// and the cascade covers steps downstream of the branch target,
+    /// but the branch SOURCE was exempted and then usually skipped on
+    /// the next pass. For validate that erased the only durable record
+    /// that a refuter broke the finding: six successful refutations in
+    /// a 113-finding batch survived nowhere but the raw JSONL.
+    #[test]
+    fn a_branching_step_keeps_its_rejected_attempt() {
+        let workflow = parse_workflow(
+            r#"{"$schema_version":1,"id":"w","steps":[
+                 {"id":"verdict","agent":"slow","prompt":"p",
+                  "outputs":{"analysis":{"type":"string"}}},
+                 {"id":"refute","agent":"slow","prompt":"p","depends_on":["verdict"],
+                  "outputs":{"refuted":{"type":"boolean"}},
+                  "eval":{"type":"field_check","expr":"refuted == false",
+                          "on_fail":{"action":"branch_to","branch_to":"verdict",
+                                     "max_attempts":2,"on_exhausted":"continue"}}}]}"#,
+        )
+        .unwrap();
+        let mut state: HashMap<String, StepState> = workflow
+            .steps
+            .iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    StepState {
+                        id: s.id.clone(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        // The refuter broke it.
+        let refute = state.get_mut("refute").unwrap();
+        refute.outputs.insert("refuted".into(), Value::Bool(true));
+        refute.status = StepStatus::Done;
+
+        // What the BranchTo arm now does before resetting.
+        if let Some(source) = state.get_mut("refute") {
+            if !source.outputs.is_empty() {
+                let rejected = source.outputs.clone();
+                source.prior_attempts.push(rejected);
+            }
+        }
+        reset_for_reentry(&mut state, "verdict");
+        reset_dependents_preserving(&workflow, &mut state, "verdict", Some("refute"));
+
+        let refute = &state["refute"];
+        assert_eq!(
+            refute.prior_attempts.len(),
+            1,
+            "the refutation must survive the branch it caused"
+        );
+        assert_eq!(refute.prior_attempts[0]["refuted"], Value::Bool(true));
+    }
+
+    #[test]
+    fn an_availability_guard_must_bind_over_the_whole_alternation() {
+        let mut steps = HashMap::new();
+        steps.insert("v".to_string(), step_state(json!({"verdict": "Plausible"})));
+        let mut inputs = Map::new();
+        inputs.insert("avail".into(), Value::Bool(false));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+
+        let unparenthesised = "v.verdict == 'Plausible' || v.verdict == 'Latent' && avail == true";
+        assert_eq!(
+            expr::eval(unparenthesised, &ctx, None),
+            Ok(true),
+            "precedence makes the guard apply to the second branch only"
+        );
+
+        let parenthesised = "(v.verdict == 'Plausible' || v.verdict == 'Latent') && avail == true";
+        assert_eq!(
+            expr::eval(parenthesised, &ctx, None),
+            Ok(false),
+            "the guard must gate every branch"
+        );
+
+        // And the shipped workflow must use the parenthesised form.
+        let wf = parse_workflow(include_str!("../../configs/workflows/validate.json")).unwrap();
+        let secondary = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "validate-refute-secondary")
+            .unwrap();
+        let run_if = secondary.run_if.as_deref().unwrap();
+        let mut real = HashMap::new();
+        real.insert(
+            "validate-reachability".to_string(),
+            step_state(json!({"verdict": "Plausible"})),
+        );
+        let mut no_secondary = Map::new();
+        no_secondary.insert("slow_secondary_available".into(), Value::Bool(false));
+        let without = ExecContext {
+            workflow_inputs: &no_secondary,
+            steps: &real,
+        };
+        assert_eq!(
+            expr::eval(run_if, &without, None),
+            Ok(false),
+            "a Plausible verdict with no secondary model must not run the step: {run_if}"
+        );
+
+        let mut has_secondary = Map::new();
+        has_secondary.insert("slow_secondary_available".into(), Value::Bool(true));
+        let with = ExecContext {
+            workflow_inputs: &has_secondary,
+            steps: &real,
+        };
+        assert_eq!(expr::eval(run_if, &with, None), Ok(true));
+    }
+
+    #[test]
+    fn verdict_eval_blocks_plausible_on_an_unanswered_refutation() {
+        // Both refuters ran and neither broke it.
+        assert!(
+            run_verdict_eval_with(
+                VerdictCase::default(),
+                vec![
+                    refuted("validate-refute", false),
+                    refuted("validate-refute-secondary", false)
+                ],
+                Value::Null,
+            )
+            .0
+        );
+
+        // Only the secondary broke it -- still blocked.
+        let (passed, reason) = run_verdict_eval_with(
+            VerdictCase::default(),
+            vec![
+                refuted("validate-refute", false),
+                refuted("validate-refute-secondary", true),
+            ],
+            Value::Null,
+        );
+        assert!(!passed);
+        assert!(reason.unwrap().contains("validate-refute-secondary"));
+
+        // Only the primary broke it -- also blocked.
+        assert!(
+            !run_verdict_eval_with(
+                VerdictCase::default(),
+                vec![
+                    refuted("validate-refute", true),
+                    refuted("validate-refute-secondary", false)
+                ],
+                Value::Null,
+            )
+            .0
+        );
+    }
+
+    #[test]
+    fn a_refutation_is_cleared_only_by_an_evidenced_rebuttal() {
+        let refuters = || vec![refuted("validate-refute", true)];
+
+        assert!(
+            run_verdict_eval_with(
+                VerdictCase::default(),
+                refuters(),
+                json!([{
+                    "refuter": "validate-refute",
+                    "rebuttal": "the writer does run on another CPU",
+                    "evidence": "kernel/sched/fair.c:1756"
+                }]),
+            )
+            .0
+        );
+
+        // An empty-evidence rebuttal is not a rebuttal.
+        assert!(
+            !run_verdict_eval_with(
+                VerdictCase::default(),
+                refuters(),
+                json!([{"refuter": "validate-refute", "rebuttal": "no", "evidence": "  "}]),
+            )
+            .0
+        );
+
+        // Answering the other refuter does not clear this one.
+        assert!(
+            !run_verdict_eval_with(
+                VerdictCase::default(),
+                refuters(),
+                json!([{
+                    "refuter": "validate-refute-secondary",
+                    "rebuttal": "x",
+                    "evidence": "kernel/sched/fair.c:1"
+                }]),
+            )
+            .0
+        );
+
+        // And a verdict below Plausible never needed a rebuttal: the
+        // refuters do not even run for those.
+        assert!(
+            run_verdict_eval_with(
+                VerdictCase {
+                    verdict: "Unconfirmed",
+                    ..Default::default()
+                },
+                refuters(),
+                Value::Null,
+            )
+            .0
+        );
+    }
+
+    #[test]
+    fn verdict_eval_keeps_the_file_side_guarantees_and_status_mapping() {
+        let step = validate_step("validate-reachability");
+        let inputs = Map::new();
+
+        for (mutate, expect) in [
+            (json!({"summary_written": false}), "summary.md"),
+            (json!({"severity_written": false}), "FINDING.md"),
+            (
+                json!({"triage_coding": {"schema_version": 2}}),
+                "schema_version",
+            ),
+        ] {
+            let mut outputs = json!({
+                "verdict": "Invalid",
+                "severity": "low",
+                "summary_written": true,
+                "severity_written": true,
+                "triage_coding": {
+                    "schema_version": 1, "severity": "low", "summary_status": "invalid"
+                }
+            });
+            for (k, v) in mutate.as_object().unwrap() {
+                outputs[k] = v.clone();
+            }
+            let mut steps = HashMap::new();
+            steps.insert(step.id.clone(), step_state(outputs));
+            let ctx = ExecContext {
+                workflow_inputs: &inputs,
+                steps: &steps,
+            };
+            let (passed, reason) = eval_validate_verdict_consistency(&step, &ctx);
+            assert!(!passed, "expected failure for {mutate}");
+            assert!(reason.unwrap().contains(expect));
+        }
+
+        // The human verdict and the machine status must agree, including
+        // for the two multi-word values.
+        for (verdict, status, ok) in [
+            ("NotADefect", "not_a_defect", true),
+            ("NotADefect", "invalid", false),
+            ("ConfirmedLatent", "confirmed_latent", true),
+        ] {
+            let outputs = json!({
+                "verdict": verdict,
+                "severity": "low",
+                "summary_written": true,
+                "severity_written": true,
+                "triage_coding": {
+                    "schema_version": 1, "severity": "low", "summary_status": status
+                }
+            });
+            let mut steps = HashMap::new();
+            steps.insert(step.id.clone(), step_state(outputs));
+            let ctx = ExecContext {
+                workflow_inputs: &inputs,
+                steps: &steps,
+            };
+            assert_eq!(
+                eval_validate_verdict_consistency(&step, &ctx).0,
+                ok,
+                "{verdict}/{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn series_assessment_requires_exact_evidenced_coverage() {
+        let (step, inputs, steps) = series_assessment_context(json!({
+            "complete": true,
+            "decision": "complete",
+            "remaining_work": [],
+            "outcomes": [
+                {"bug": "bug-a", "outcome": "fixed", "evidence": "commit a"},
+                {"bug": "bug-b", "outcome": "invalidated", "evidence": "source:b"}
+            ]
+        }));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        assert_eq!(eval_fix_series_assessment(&step, &ctx), (true, None));
+
+        let (step, inputs, steps) = series_assessment_context(json!({
+            "complete": false,
+            "decision": "revise_pending_plan",
+            "remaining_work": ["add bug-c todo"],
+            "outcomes": [
+                {"bug": "bug-a", "outcome": "invented", "evidence": "x"},
+                {"bug": "bug-b", "outcome": "unresolved", "evidence": "missing audit"}
+            ],
+            "plan_update": {"expected_revision": 2, "operations": []}
+        }));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        assert!(!eval_fix_series_assessment(&step, &ctx).0);
+
+        let (step, inputs, steps) = series_assessment_context(json!({
+            "complete": false,
+            "decision": "failure",
+            "remaining_work": ["the produced series is unsafe"],
+            "outcomes": [
+                {"bug": "bug-a", "outcome": "unresolved", "evidence": "bad patch"},
+                {"bug": "bug-b", "outcome": "fixed", "evidence": "commit b"}
+            ]
+        }));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        assert_eq!(eval_fix_series_assessment(&step, &ctx), (true, None));
+
+        let (step, inputs, steps) = series_assessment_context(json!({
+            "complete": true,
+            "decision": "complete",
+            "remaining_work": [],
+            "outcomes": [
+                {"bug": "bug-a", "outcome": "fixed", "evidence": "commit a"}
+            ]
+        }));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        let (passed, reason) = eval_fix_series_assessment(&step, &ctx);
+        assert!(!passed);
+        assert!(reason.unwrap().contains("cover every original bug"));
+
+        let (step, inputs, steps) = series_assessment_context(json!({
+            "complete": false,
+            "decision": "revise_pending_plan",
+            "remaining_work": ["add bug-c todo"],
+            "outcomes": [
+                {"bug": "bug-a", "outcome": "fixed", "evidence": "commit a"},
+                {"bug": "bug-b", "outcome": "unresolved", "evidence": "missing caller audit"}
+            ],
+            "plan_update": {"expected_revision": 2, "operations": []}
+        }));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        assert_eq!(eval_fix_series_assessment(&step, &ctx), (true, None));
+    }
+
+    #[test]
+    fn prior_attempts_value_preserves_every_field() {
+        let mut st = StepState::default();
+        for i in 0..2 {
+            let mut entry = Map::new();
+            entry.insert("analysis".into(), Value::String(format!("attempt {i}")));
+            entry.insert("changed_files".into(), json!(["a.c"]));
+            entry.insert(
+                "code_edits".into(),
+                json!([{"file_path": "a.c", "old_string": "x", "new_string": "y"}]),
+            );
+            st.prior_attempts.push(entry);
+        }
+        let expected = serde_json::to_value(&st.prior_attempts).unwrap();
+        let v = st.prior_attempts_value();
+        assert_eq!(v, expected);
+        let arr = v.as_array().expect("array");
+        assert_eq!(arr.len(), 2);
+        for entry in arr {
+            assert!(entry.get("code_edits").is_some(), "code_edits preserved");
+            assert!(entry.get("analysis").is_some(), "analysis preserved");
+        }
+    }
+
+    #[test]
+    fn reset_for_reentry_snapshots_outputs_into_prior_attempts() {
+        // branch_to / rerun_chain / on_exhausted-branch all call
+        // reset_for_reentry on the target step. The target's prior
+        // outputs encoded a real attempt at its job that the workflow
+        // is now re-driving; they must land in prior_attempts so the
+        // next attempt's prompt can read them via
+        // `{{<step>.prior_attempts}}`.
+        let mut state: HashMap<String, StepState> = HashMap::new();
+        let mut outputs = Map::new();
+        outputs.insert("changed_files".into(), json!(["a.c"]));
+        outputs.insert("code_changes_emitted".into(), Value::Bool(true));
+        let st = StepState {
+            status: StepStatus::Done,
+            outputs,
+            ..StepState::default()
+        };
+        state.insert("write-patch".into(), st);
+
+        reset_for_reentry(&mut state, "write-patch");
+
+        let after = state.get("write-patch").expect("step state preserved");
+        assert_eq!(after.status, StepStatus::Pending);
+        assert!(
+            after.outputs.is_empty(),
+            "outputs must be cleared so the next run starts fresh: {:?}",
+            after.outputs
+        );
+        assert_eq!(
+            after.prior_attempts.len(),
+            1,
+            "non-empty outputs must be snapshotted into prior_attempts"
+        );
+        assert_eq!(
+            after.prior_attempts[0]
+                .get("code_changes_emitted")
+                .and_then(Value::as_bool),
+            Some(true),
+            "snapshot must carry typed fields verbatim"
+        );
+
+        // Second reset_for_reentry with empty outputs must not push an
+        // empty entry — otherwise the next attempt sees noise.
+        reset_for_reentry(&mut state, "write-patch");
+        let after2 = state.get("write-patch").expect("step state preserved");
+        assert_eq!(
+            after2.prior_attempts.len(),
+            1,
+            "empty outputs must not be snapshotted"
+        );
+    }
+
+    /// `reset_dependents_preserving` must (a) stash outputs into
+    /// `preserved_outputs_on_skip` for dependents that have the
+    /// `preserve_outputs_on_skip` flag set, and (b) snapshot outputs
+    /// into `prior_attempts` for dependents without the flag. The
+    /// snapshot path is what gives the orchestrator visibility into
+    /// the cycle's build/review/triage results even when the cascade
+    /// skip-cleared their live outputs (regression that caused the
+    /// sha256_direct_ctx_not_wiped_on_stack run to hit the 10-attempt
+    /// orchestrator cap with empty signals).
+    #[test]
+    fn reset_dependents_preserving_stashes_or_snapshots_outputs() {
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "preserve-test",
+            "steps": [
+                {"id": "a", "agent": "fast", "prompt": "p"},
+                {
+                    "id": "b",
+                    "agent": "fast",
+                    "prompt": "p",
+                    "depends_on": ["a"],
+                    "preserve_outputs_on_skip": true,
+                    "outputs": {"result": {"type": "string"}}
+                },
+                {
+                    "id": "c",
+                    "agent": "fast",
+                    "prompt": "p",
+                    "depends_on": ["a"],
+                    "outputs": {"result": {"type": "string"}}
+                }
+            ]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+        let mut state: HashMap<String, StepState> = HashMap::new();
+        let mut b_outputs = Map::new();
+        b_outputs.insert("result".into(), json!("cycle-1-b"));
+        state.insert(
+            "b".into(),
+            StepState {
+                status: StepStatus::Done,
+                outputs: b_outputs,
+                ..StepState::default()
+            },
+        );
+        let mut c_outputs = Map::new();
+        c_outputs.insert("result".into(), json!("cycle-1-c"));
+        state.insert(
+            "c".into(),
+            StepState {
+                status: StepStatus::Done,
+                outputs: c_outputs,
+                ..StepState::default()
+            },
+        );
+        state.insert(
+            "a".into(),
+            StepState {
+                status: StepStatus::Done,
+                ..StepState::default()
+            },
+        );
+
+        reset_dependents_preserving(&wf, &mut state, "a", None);
+
+        // b has preserve_outputs_on_skip → outputs go into the
+        // preserved_outputs_on_skip slot for restore on later skip.
+        let b = state.get("b").unwrap();
+        assert_eq!(b.status, StepStatus::Pending, "b must be marked Pending");
+        assert!(
+            b.outputs.is_empty(),
+            "b.outputs cleared while Pending so downstream doesn't observe stale data prematurely"
+        );
+        assert_eq!(
+            b.preserved_outputs_on_skip
+                .get("result")
+                .and_then(Value::as_str),
+            Some("cycle-1-b"),
+            "preserve_outputs_on_skip=true must stash outputs"
+        );
+        assert!(
+            b.prior_attempts.is_empty(),
+            "preserve path is preferred when the flag is set; prior_attempts not used"
+        );
+
+        // c has no preserve flag → outputs are snapshotted into
+        // prior_attempts so a later interpolation can read them via
+        // `{{c.prior_attempts}}` (orchestrator visibility path).
+        let c = state.get("c").unwrap();
+        assert_eq!(c.status, StepStatus::Pending);
+        assert!(
+            c.outputs.is_empty(),
+            "c.outputs cleared so downstream run_if expressions aren't tripped by stale values"
+        );
+        assert!(
+            c.preserved_outputs_on_skip.is_empty(),
+            "no preserve flag → nothing stashed in preserved_outputs_on_skip"
+        );
+        assert_eq!(
+            c.prior_attempts.len(),
+            1,
+            "outputs snapshotted to prior_attempts"
+        );
+        assert_eq!(
+            c.prior_attempts[0].get("result").and_then(Value::as_str),
+            Some("cycle-1-c")
+        );
+    }
+
+    fn review_workflow() -> Workflow {
+        parse_workflow(include_str!("../../configs/workflows/review.json")).unwrap()
+    }
+
+    fn lensed_review_workflow() -> Workflow {
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "lensed-review-test",
+            "steps": [{
+                "id": "investigate",
+                "agent": "slow",
+                "prompt": "lens={{lens.id}}",
+                "lenses": [
+                    {"id": "lifetime"},
+                    {"id": "memory"},
+                    {"id": "bounds"},
+                    {"id": "races"},
+                    {"id": "general"}
+                ],
+                "aggregate": "consolidate",
+                "consolidate": {"agent": "fast", "prompt": "merge"},
+                "outputs": {"findings": {"type": "array<object>"}}
+            }]
+        });
+        parse_workflow(&wf_json.to_string()).unwrap()
+    }
+
+    fn target_inputs() -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert("target".into(), json!("drivers/example/example.c"));
+        m.insert("target_is_commit".into(), json!(false));
+        m
+    }
+
+    #[test]
+    fn format_event_summarizes_long_outputs() {
+        let mut outputs = Map::new();
+        outputs.insert(
+            "analysis".into(),
+            json!(format!(
+                "The patch adds the missing cleanup call. This pairs object lifetime correctly. {}",
+                "Extra detail should not flood the terminal. ".repeat(80)
+            )),
+        );
+        outputs.insert("clean".into(), json!(true));
+        outputs.insert("defects".into(), json!([]));
+
+        let line = format_event(&TraceEvent::StepProduced {
+            id: "review".into(),
+            attempt: 1,
+            outputs,
+        });
+
+        assert!(line.contains("✓ produced review (attempt 1)"));
+        assert!(line.contains("analysis: The patch adds the missing cleanup call."));
+        assert!(line.contains("clean=true"));
+        assert!(!line.contains("defects=[]"));
+        assert!(line.contains("..."));
+        assert!(line.len() < 1_200);
+    }
+
+    #[tokio::test]
+    async fn shipped_review_workflow_uses_parallel_lenses() {
+        let wf = review_workflow();
+        assert_eq!(wf.steps.len(), 1);
+        assert_eq!(wf.steps[0].id, "investigate");
+        assert_eq!(wf.steps[0].lenses.len(), 5);
+        assert!(wf.steps[0].consolidate.is_some());
+        assert!(wf.steps[0].outputs.contains_key("analysis"));
+        assert_eq!(
+            wf.steps[0].eval.as_ref().and_then(|e| e.expr.as_deref()),
+            Some("analysis != ''")
+        );
+        let mut driver = ScriptedDriver::new()
+            .with(
+                "investigate|memory-lifetime",
+                1,
+                json!({"analysis": "checked memory and lifetime", "findings": []}),
+            )
+            .with(
+                "investigate|bounds",
+                1,
+                json!({"analysis": "checked bounds", "findings": []}),
+            )
+            .with(
+                "investigate|races",
+                1,
+                json!({"analysis": "checked races", "findings": []}),
+            )
+            .with(
+                "investigate|general",
+                1,
+                json!({"analysis": "checked general", "findings": []}),
+            )
+            .with(
+                "investigate|@consolidate",
+                1,
+                json!({
+                    "analysis": "clean review",
+                    "findings": [],
+                    "followups": [],
+                }),
+            );
+        let trace = run(&wf, &mut driver, target_inputs()).await;
+        assert_eq!(trace.status, WorkflowStatus::Success);
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::FanOut { id, lens_ids, .. } if id == "investigate" && lens_ids.len() == 4
+        )));
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::Consolidating { id, lens_count, .. } if id == "investigate" && *lens_count == 4
+        )));
+    }
+
+    #[test]
+    fn shipped_review_workflow_requests_full_findings() {
+        let wf = review_workflow();
+        let step = &wf.steps[0];
+        let prompt = step.prompt.as_deref().unwrap();
+        let review_intro = wf
+            .globals
+            .get("review_intro")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        let contract_trace = wf
+            .globals
+            .get("contract_trace")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        let schema = wf
+            .globals
+            .get("finding_schema")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        let consolidate = step.consolidate.as_ref().unwrap().prompt.as_str();
+        let eval = step.eval.as_ref().unwrap();
+
+        assert!(schema.contains("A NEW finding is a full Finding record"));
+        assert!(schema.contains("reuse its id and send ONLY the fields that changed"));
+        assert!(schema.contains("relevant_symbols"));
+        assert!(schema.contains("\"followups\""));
+        assert!(review_intro.contains("Find every concrete correctness bug"));
+        assert!(review_intro.contains("Do not stop after the first issue"));
+        assert!(review_intro.contains("A clean result is valid only"));
+        assert!(review_intro.contains("concrete unresolved suspicion is not a clean result"));
+        assert!(review_intro.contains("chains of events"));
+        assert!(contract_trace.contains("semantic change, not just the edited lines"));
+        assert!(contract_trace.contains("callback target"));
+        assert!(contract_trace.contains("Negative coverage claims require concrete evidence"));
+        assert!(contract_trace.contains("source/type/search/callgraph/history context"));
+        assert!(contract_trace.contains("Do not hardcode"));
+        assert!(step.include.iter().any(|i| i.contains("contract_trace")));
+        assert!(step.include.iter().any(|i| i.contains("finding_schema")));
+        assert!(step.outputs.contains_key("analysis"));
+        assert!(step.outputs.contains_key("findings"));
+        assert!(step.outputs.contains_key("followups"));
+        // followups_empty is no longer a workflow output; the eval
+        // reads `followups` directly.
+        assert!(!step.outputs.contains_key("followups_empty"));
+        assert_eq!(
+            step.outputs["findings"]
+                .get("type")
+                .and_then(|v| v.as_str()),
+            Some("array<Finding>")
+        );
+        assert_eq!(
+            step.outputs["followups"]
+                .get("type")
+                .and_then(|v| v.as_str()),
+            Some("array<Followup>")
+        );
+        assert_eq!(eval.kind, crate::workflow::EvalKind::FieldCheck);
+        assert_eq!(eval.expr.as_deref(), Some("analysis != ''"));
+        assert_eq!(eval.on_fail.action, crate::workflow::OnFailAction::Repeat);
+        assert_eq!(eval.on_fail.max_attempts, Some(3));
+        assert!(!wf
+            .completion
+            .as_ref()
+            .unwrap()
+            .failure_when_any
+            .iter()
+            .any(|expr| expr.contains("followups_empty")));
+        assert!(prompt.contains("full Finding record"));
+        assert!(prompt.contains("do not emit simplified"));
+        assert!(prompt.contains("Find every bug you can involving the target"));
+        assert!(prompt.contains("Followups are the normal next frontier"));
+        assert!(prompt.contains("trace the semantic contracts changed by the diff"));
+        assert!(prompt.contains("callers, callees, callbacks"));
+        assert!(prompt.contains("old path unreachable"));
+        assert!(prompt.contains("caller/callee"));
+        assert!(prompt.contains("specific concern is plausible"));
+        assert!(prompt.contains("strong-suspect Finding"));
+        assert!(
+            prompt.contains("represented by a Finding with open_questions or by a typed followup")
+        );
+        assert!(!prompt.contains("file: file:line citation"));
+        assert!(consolidate.contains("full Finding records"));
+        assert!(consolidate.contains("concrete unresolved suspicion is not droppable"));
+        assert!(consolidate.contains("strong-suspect Finding with open_questions"));
+        assert!(consolidate.contains("`followups`"));
+        assert!(consolidate.contains("entry naming the exact"));
+        assert!(consolidate.contains("unsupported negative coverage claims"));
+        // followups_empty is no longer a declared output; the
+        // consolidate prompt must not reference it.
+        assert!(!consolidate.contains("followups_empty"));
+        assert!(!consolidate.contains("set `lenses`"));
+    }
+
+    #[tokio::test]
+    async fn executor_discards_failed_attempt_before_accepting_retry() {
+        struct TransactionDriver {
+            accepted: std::sync::Mutex<Vec<u32>>,
+            discarded: std::sync::Mutex<Vec<u32>>,
+        }
+
+        #[async_trait]
+        impl Driver for TransactionDriver {
+            async fn run(
+                &self,
+                _step: &Step,
+                attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                Ok(serde_json::from_value(json!({
+                    "analysis": if attempt == 1 { "" } else { "accepted" },
+                    "findings": [],
+                    "followups": []
+                }))
+                .unwrap())
+            }
+
+            async fn apply_attempt_effects(
+                &self,
+                _step: &Step,
+                attempt: u32,
+                _effects: &Value,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<Map<String, Value>, String> {
+                self.accepted.lock().unwrap().push(attempt);
+                Ok(Map::new())
+            }
+
+            async fn discard_attempt(&self, _step: &Step, attempt: u32) {
+                self.discarded.lock().unwrap().push(attempt);
+            }
+        }
+
+        let mut workflow = review_workflow();
+        workflow.steps.truncate(1);
+        workflow.steps[0].lenses.clear();
+        let mut driver = TransactionDriver {
+            accepted: std::sync::Mutex::new(Vec::new()),
+            discarded: std::sync::Mutex::new(Vec::new()),
+        };
+        let trace = run(&workflow, &mut driver, target_inputs()).await;
+
+        assert_eq!(trace.status, WorkflowStatus::Success);
+        assert_eq!(*driver.discarded.lock().unwrap(), vec![1]);
+        assert_eq!(*driver.accepted.lock().unwrap(), vec![2]);
+        assert_eq!(
+            trace
+                .events
+                .iter()
+                .filter(|event| matches!(event, TraceEvent::StepProduced { .. }))
+                .count(),
+            2,
+            "effect application must not emit a second StepProduced for the accepted model attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_replays_durable_effects_without_rerunning_model() {
+        struct EffectDriver {
+            runs: std::sync::Mutex<u32>,
+            applies: std::sync::Mutex<u32>,
+            fail_apply: bool,
+        }
+
+        #[async_trait]
+        impl Driver for EffectDriver {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                *self.runs.lock().unwrap() += 1;
+                Ok(Map::from_iter([("analysis".into(), json!("accepted"))]))
+            }
+
+            async fn attempt_effects(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<Value, String> {
+                Ok(json!([{"path": "/tmp/result", "body": "accepted"}]))
+            }
+
+            async fn apply_attempt_effects(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _effects: &Value,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<Map<String, Value>, String> {
+                *self.applies.lock().unwrap() += 1;
+                if self.fail_apply {
+                    Err("injected interruption".into())
+                } else {
+                    Ok(Map::new())
+                }
+            }
+        }
+
+        let workflow = crate::workflow::parse_workflow(
+            &json!({
+                "$schema_version": 1,
+                "id": "effect-resume",
+                "steps": [{"id": "write", "agent": "slow", "prompt": "write"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let snapshots = tempfile::tempdir().unwrap();
+        let mut first = EffectDriver {
+            runs: std::sync::Mutex::new(0),
+            applies: std::sync::Mutex::new(0),
+            fail_apply: true,
+        };
+        let first_trace = run_with_persistence(
+            &workflow,
+            &mut first,
+            Map::new(),
+            20,
+            snapshots.path().to_path_buf(),
+        )
+        .await;
+        assert!(matches!(first_trace.status, WorkflowStatus::Failure(_)));
+        assert_eq!(*first.runs.lock().unwrap(), 1);
+        assert_eq!(*first.applies.lock().unwrap(), 1);
+
+        let snapshot = WorkflowSnapshot::load(snapshots.path(), "effect-resume").unwrap();
+        assert_eq!(snapshot.steps[0].status, StepStatus::EffectsPending);
+        assert!(snapshot.steps[0].pending_effects.is_some());
+        let mut resumed = EffectDriver {
+            runs: std::sync::Mutex::new(0),
+            applies: std::sync::Mutex::new(0),
+            fail_apply: false,
+        };
+        let resumed_trace = run_resume(
+            &workflow,
+            &mut resumed,
+            snapshot,
+            Some(snapshots.path().to_path_buf()),
+            20,
+        )
+        .await;
+        assert_eq!(resumed_trace.status, WorkflowStatus::Success);
+        assert_eq!(*resumed.runs.lock().unwrap(), 0);
+        assert_eq!(*resumed.applies.lock().unwrap(), 1);
+        assert_eq!(resumed_trace.final_state["write"].status, StepStatus::Done);
+        assert!(resumed_trace.final_state["write"].pending_effects.is_none());
+    }
+
+    #[test]
+    fn research_prompt_overrides_stale_metadata_yaml_status() {
+        // Regression: in the coredump_dump_head_double_handoff
+        // session, attempt 1 verified the bug present at HEAD and
+        // returned confirmed; the JSON-shape repair retry flipped to
+        // invalid by citing `metadata.yaml records status:
+        // invalidated`. The prompt must say HEAD source is
+        // authoritative and the yaml is a stale snapshot.
+        //
+        // Uses prompt_contains_phrase so the assertions don't snap
+        // every time the JSON file re-wraps the prompt across array
+        // elements — these check meaning, not exact tokenisation.
+        use crate::workflow::prompt_contains_phrase;
+        let wf = fix_workflow();
+        let research = wf.steps.iter().find(|s| s.id == "research").unwrap();
+        let prompt = research.prompt.as_deref().unwrap_or("");
+        assert!(
+            prompt_contains_phrase(prompt, "stale snapshot"),
+            "research prompt must label metadata.yaml status as stale"
+        );
+        assert!(
+            prompt_contains_phrase(prompt, "authoritative source of truth is current"),
+            "research prompt must name code at HEAD as authoritative"
+        );
+        assert!(
+            prompt_contains_phrase(
+                prompt,
+                "publish step rewrites metadata.yaml when the patch lands"
+            ),
+            "research prompt must promise the yaml gets rewritten on publish"
+        );
+        assert!(
+            prompt_contains_phrase(
+                prompt,
+                "Treating the yaml status as invalidating evidence is the failure mode"
+            ),
+            "research prompt must explicitly call out the failure mode"
+        );
+        assert!(
+            prompt_contains_phrase(
+                prompt,
+                "SHAs found in metadata.yaml, summary.md, FINDING.md, auto-generated-fix*.diff"
+            ),
+            "research prompt must treat artifact SHAs as hints only"
+        );
+        assert!(
+            prompt_contains_phrase(
+                prompt,
+                "`git merge-base --is-ancestor <sha> HEAD` is the authoritative reachability test"
+            ),
+            "research prompt must use merge-base for reachability from HEAD"
+        );
+        assert!(
+            prompt_contains_phrase(
+                prompt,
+                "Do not infer ancestry from an empty `git log <sha>..HEAD`"
+            ),
+            "research prompt must reject the empty-range ancestry mistake"
+        );
+        assert!(
+            prompt_contains_phrase(
+                prompt,
+                "combination of commit reachability (when a SHA is cited), subject/message match, and semantic source evidence"
+            ),
+            "research prompt must require SHA + subject + semantic source evidence for existing patch claims"
+        );
+    }
+
+    #[test]
+    fn audit_prompt_routes_unverified_claims() {
+        let prompt = include_str!("../../configs/prompts/slow-code-agent-audit.system.md");
+
+        assert!(prompt.contains("Unverified concrete suspicions must be routed"));
+        assert!(prompt.contains("emit a Finding with `open_questions`"));
+        assert!(prompt.contains("emit a typed followup for the exact missing evidence"));
+        assert!(prompt.contains(
+            "A clean result is valid only when no unresolved concrete suspicion remains"
+        ));
+        assert!(prompt
+            .contains("Every `[UNVERIFIED]` statement tied to a concrete correctness concern"));
+    }
+
+    #[test]
+    fn shipped_fix_review_routes_unverified_claims_as_defects() {
+        let wf = fix_workflow();
+        let step = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "review")
+            .expect("fix workflow review step");
+        let prompt = step.prompt.as_deref().unwrap();
+        let consolidate = step.consolidate.as_ref().unwrap().prompt.as_str();
+
+        // Lens prompt: typed unresolved_risks contract.
+        use crate::workflow::prompt_contains_phrase;
+        assert!(prompt_contains_phrase(
+            prompt,
+            "Unresolved-risk routing requirement"
+        ));
+        assert!(prompt_contains_phrase(
+            prompt,
+            "either run it down in this lens with cited source"
+        ));
+        assert!(prompt_contains_phrase(prompt, "emit an entry in"));
+        assert!(prompt.contains("`unresolved_risks[]`"));
+        assert!(prompt_contains_phrase(
+            prompt,
+            "`clean=true` is inconsistent with a"
+        ));
+        // Routing is owned by the post-review orchestrator now,
+        // not by typed-field heuristics in Rust.
+        assert!(prompt_contains_phrase(
+            prompt,
+            "post-review orchestrator reads the typed"
+        ));
+
+        // Consolidate prompt: derives consolidated state from typed lens fields.
+        assert!(consolidate.contains("typed lens fields"));
+        assert!(consolidate.contains("trust the typed buckets"));
+        assert!(consolidate.contains("deduping the union"));
+
+        // Keep the guard generic: this should fail if the workflow regresses
+        // to a one-off checklist for a specific field/allocator bug.
+        assert!(!prompt.contains("Initialization/default-state requirement"));
+    }
+
+    #[tokio::test]
+    async fn shipped_review_workflow_preserves_followups_for_outer_loop() {
+        let wf = review_workflow();
+        let first_followup = json!([{
+            "type": "read",
+            "name": "drivers/example/example.c:1+40",
+            "reason": "need surrounding source to prove the concern"
+        }]);
+        let mut driver = ScriptedDriver::new()
+            .with(
+                "investigate|lifetime",
+                1,
+                json!({"analysis": "needs more source", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|memory",
+                1,
+                json!({"analysis": "needs more source", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|bounds",
+                1,
+                json!({"analysis": "needs more source", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|races",
+                1,
+                json!({"analysis": "needs more source", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|general",
+                1,
+                json!({"analysis": "needs more source", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|@consolidate",
+                1,
+                json!({
+                    "analysis": "not done; followup needed",
+                    "findings": [],
+                    "followups": first_followup,
+                }),
+            );
+
+        let trace = run_with_cap(&wf, &mut driver, target_inputs(), 20).await;
+
+        assert!(matches!(
+            trace.status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        ));
+        let attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "investigate" => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attempts, vec![1]);
+        assert!(!trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::EvalFailed { id, .. } if id == "investigate"
+        )));
+        let followups = trace
+            .final_state
+            .get("investigate")
+            .and_then(|s| s.outputs.get("followups"))
+            .and_then(|v| v.as_array())
+            .expect("followups output");
+        assert_eq!(followups.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shipped_review_workflow_repeats_for_empty_analysis() {
+        let wf = review_workflow();
+        let mut driver = ScriptedDriver::new()
+            .with(
+                "investigate|lifetime",
+                1,
+                json!({"analysis": "", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|memory",
+                1,
+                json!({"analysis": "", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|bounds",
+                1,
+                json!({"analysis": "", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|races",
+                1,
+                json!({"analysis": "", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|general",
+                1,
+                json!({"analysis": "", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|@consolidate",
+                1,
+                json!({
+                    "analysis": "",
+                    "findings": [],
+                    "followups": [],
+                }),
+            )
+            .with(
+                "investigate|lifetime",
+                2,
+                json!({"analysis": "checked lifetime", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|memory",
+                2,
+                json!({"analysis": "checked memory", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|bounds",
+                2,
+                json!({"analysis": "checked bounds", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|races",
+                2,
+                json!({"analysis": "checked races", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|general",
+                2,
+                json!({"analysis": "checked general", "findings": [], "followups": []}),
+            )
+            .with(
+                "investigate|@consolidate",
+                2,
+                json!({
+                    "analysis": "clean review after a real pass",
+                    "findings": [],
+                    "followups": [],
+                }),
+            );
+
+        let trace = run_with_cap(&wf, &mut driver, target_inputs(), 20).await;
+
+        assert!(matches!(
+            trace.status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        ));
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::EvalFailed { id, attempt: 1, .. } if id == "investigate"
+        )));
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::EvalPassed { id, attempt: 2 } if id == "investigate"
+        )));
+    }
+
+    /// Lensed step fans out, every lens returns a finding, aggregator
+    /// concatenates the per-lens `findings` arrays and tags each entry
+    /// with its source lens. Uses an inline `aggregate: concat`
+    /// workflow so the executor feature is tested independently of
+    /// the shipped review workflow.
+    #[tokio::test]
+    async fn lens_fan_out_concat_aggregates_findings() {
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "concat-test",
+            "steps": [{
+                "id": "investigate",
+                "agent": "slow",
+                "prompt": "lens={{lens.id}}",
+                "lenses": [
+                    {"id": "lifetime"},
+                    {"id": "memory"},
+                    {"id": "bounds"},
+                    {"id": "races"},
+                    {"id": "general"}
+                ],
+                "aggregate": "concat",
+                "outputs": {
+                    "findings": {"type": "array<object>"}
+                }
+            }]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+        let mut driver = ScriptedDriver::new()
+            .with(
+                "investigate|lifetime",
+                1,
+                json!({"findings": [{"file": "x.c:1", "what": "leak", "severity": "high"}]}),
+            )
+            .with(
+                "investigate|memory",
+                1,
+                json!({"findings": [{"file": "x.c:2", "what": "uaf", "severity": "high"}]}),
+            )
+            .with(
+                "investigate|bounds",
+                1,
+                json!({"findings": [{"file": "x.c:3", "what": "ovf", "severity": "medium"}]}),
+            )
+            .with("investigate|races", 1, json!({"findings": []}))
+            .with(
+                "investigate|general",
+                1,
+                json!({"findings": [{"file": "x.c:4", "what": "null", "severity": "low"}]}),
+            );
+        let trace = run(&wf, &mut driver, target_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert_eq!(trace.status, WorkflowStatus::Success);
+
+        // FanOut event names every lens.
+        let fan_out = trace
+            .events
+            .iter()
+            .find_map(|e| match e {
+                TraceEvent::FanOut { id, lens_ids, .. } if id == "investigate" => {
+                    Some(lens_ids.clone())
+                }
+                _ => None,
+            })
+            .expect("FanOut for investigate");
+        assert_eq!(
+            fan_out,
+            vec!["lifetime", "memory", "bounds", "races", "general"]
+        );
+
+        // Five LensProduced events, one per lens.
+        let lens_count = trace
+            .events
+            .iter()
+            .filter(|e| matches!(e, TraceEvent::LensProduced { id, .. } if id == "investigate"))
+            .count();
+        assert_eq!(lens_count, 5);
+
+        // FanIn aggregated findings — 4 (one lens returned []), each
+        // tagged with its source lens.
+        let aggregated = trace
+            .events
+            .iter()
+            .find_map(|e| match e {
+                TraceEvent::FanIn { id, aggregated, .. } if id == "investigate" => {
+                    Some(aggregated.clone())
+                }
+                _ => None,
+            })
+            .expect("FanIn for investigate");
+        let findings = aggregated.get("findings").unwrap().as_array().unwrap();
+        assert_eq!(findings.len(), 4, "4 non-empty lens findings");
+        let lenses: Vec<String> = findings
+            .iter()
+            .map(|f| f.get("lens").unwrap().as_str().unwrap().to_string())
+            .collect();
+        assert!(lenses.contains(&"lifetime".to_string()));
+        assert!(lenses.contains(&"memory".to_string()));
+        assert!(lenses.contains(&"bounds".to_string()));
+        assert!(lenses.contains(&"general".to_string()));
+        assert!(!lenses.contains(&"races".to_string()));
+    }
+
+    /// One lens errors → workflow fails with a message naming the
+    /// lens. Verifies the fan-out's error-aggregation surfaces the
+    /// right step + lens.
+    #[tokio::test]
+    async fn lens_error_terminates_workflow() {
+        // Custom driver: returns an Err for the "races" lens, OK for
+        // the rest.
+        struct PartiallyFailingDriver;
+        #[async_trait]
+        impl Driver for PartiallyFailingDriver {
+            async fn run(
+                &self,
+                step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                if step.id == "investigate" {
+                    if lens.map(|l| l.id.as_str()) == Some("races") {
+                        return Err("racy lens blew up".into());
+                    }
+                    return Ok(serde_json::from_value(json!({"findings": []})).unwrap());
+                }
+                Ok(Map::new())
+            }
+        }
+
+        let wf = lensed_review_workflow();
+        let mut driver = PartiallyFailingDriver;
+        let trace = run(&wf, &mut driver, target_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        match &trace.status {
+            WorkflowStatus::Failure(msg) => {
+                assert!(msg.contains("investigate"), "got: {msg}");
+                assert!(msg.contains("races"), "got: {msg}");
+            }
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    /// `aggregate: consolidate` runs an N+1 LLM call after the
+    /// fan-out. The scripted driver returns scripted per-lens
+    /// outputs, then a scripted consolidate response (looked up by
+    /// `<step_id>|@consolidate`). The aggregated outputs in the
+    /// FanIn event come from the consolidate response, not from
+    /// concat'ing the lens outputs.
+    #[tokio::test]
+    async fn lens_consolidate_runs_n_plus_one_call() {
+        let wf = lensed_review_workflow();
+        let mut driver = ScriptedDriver::new()
+            // Per-lens outputs — three lenses report the same bug
+            // in slightly different words; two report distinct ones.
+            .with(
+                "investigate|lifetime",
+                1,
+                json!({"findings": [{"file": "x.c:42", "what": "leak in foo()", "severity": "high"}]}),
+            )
+            .with(
+                "investigate|memory",
+                1,
+                json!({"findings": [{"file": "x.c:42", "what": "foo() forgets to release ref", "severity": "high"}]}),
+            )
+            .with(
+                "investigate|bounds",
+                1,
+                json!({"findings": [{"file": "y.c:7", "what": "ovf", "severity": "medium"}]}),
+            )
+            .with("investigate|races", 1, json!({"findings": []}))
+            .with(
+                "investigate|general",
+                1,
+                json!({"findings": [{"file": "z.c:1", "what": "null deref", "severity": "low"}]}),
+            )
+            // Scripted consolidate response — the LLM "merged" the
+            // two leak findings into one tagged with both lenses.
+            .with(
+                "investigate|@consolidate",
+                1,
+                json!({
+                    "findings": [
+                        {"file": "x.c:42", "what": "leak in foo()", "severity": "high",
+                         "lenses": ["lifetime", "memory"]},
+                        {"file": "y.c:7",  "what": "ovf",            "severity": "medium",
+                         "lenses": ["bounds"]},
+                        {"file": "z.c:1",  "what": "null deref",     "severity": "low",
+                         "lenses": ["general"]}
+                    ]
+                }),
+            );
+
+        let trace = run(&wf, &mut driver, target_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert_eq!(trace.status, WorkflowStatus::Success);
+
+        // Consolidating event records the call.
+        let consolidating = trace
+            .events
+            .iter()
+            .find(|e| matches!(e, TraceEvent::Consolidating { id, .. } if id == "investigate"));
+        assert!(consolidating.is_some(), "expected Consolidating event");
+        if let Some(TraceEvent::Consolidating { lens_count, .. }) = consolidating {
+            assert_eq!(*lens_count, 5);
+        }
+
+        // FanIn carries the consolidate response (3 findings, not 4
+        // tagged-by-lens entries from a concat path).
+        let aggregated = trace
+            .events
+            .iter()
+            .find_map(|e| match e {
+                TraceEvent::FanIn {
+                    aggregated,
+                    strategy,
+                    ..
+                } if strategy == "Consolidate" => Some(aggregated.clone()),
+                _ => None,
+            })
+            .expect("FanIn with Consolidate strategy");
+        let findings = aggregated.get("findings").unwrap().as_array().unwrap();
+        assert_eq!(findings.len(), 3, "consolidate merged 4 raw → 3");
+        // First entry has merged `lenses` (no singular `lens` field).
+        let first = &findings[0];
+        let lenses = first.get("lenses").unwrap().as_array().unwrap();
+        assert_eq!(
+            lenses
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["lifetime", "memory"]
+        );
+    }
+
+    /// When the driver doesn't implement consolidate, the workflow
+    /// fails loudly instead of silently dropping findings.
+    #[tokio::test]
+    async fn consolidate_without_driver_support_fails_loudly() {
+        struct NoConsolidate;
+        #[async_trait]
+        impl Driver for NoConsolidate {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                Ok(serde_json::from_value(json!({"findings": []})).unwrap())
+            }
+            // effect application + consolidate fall back to defaults;
+            // the default consolidate impl returns Err.
+        }
+        let wf = lensed_review_workflow();
+        let mut driver = NoConsolidate;
+        let trace = run(&wf, &mut driver, target_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        match &trace.status {
+            WorkflowStatus::Failure(msg) => {
+                assert!(msg.contains("investigate"), "got: {msg}");
+                assert!(
+                    msg.contains("consolidate") || msg.contains("does not implement"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    /// judge_llm eval consults the driver's judge() method; when
+    /// the judge returns false, on_fail's repeat re-runs the step.
+    #[tokio::test]
+    async fn judge_llm_eval_dispatches_to_driver() {
+        struct CountingJudge {
+            calls: std::sync::Arc<std::sync::Mutex<u32>>,
+        }
+        #[async_trait]
+        impl Driver for CountingJudge {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                Ok(serde_json::from_value(json!({"x": 1})).unwrap())
+            }
+            async fn judge(
+                &self,
+                _step: &Step,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<(bool, String), String> {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                // Pass on the second call so the workflow terminates.
+                Ok((*n >= 2, format!("call {n}")))
+            }
+        }
+
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "judge-test",
+            "steps": [{
+                "id": "s",
+                "agent": "fast",
+                "prompt": "p",
+                "outputs": {"x": {"type": "integer"}},
+                "eval": {
+                    "type": "judge_llm",
+                    "judge_prompt": "Is x positive?",
+                    "on_fail": {"action": "repeat", "max_attempts": 3}
+                }
+            }]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let mut driver = CountingJudge {
+            calls: calls.clone(),
+        };
+        let trace = run(&wf, &mut driver, Map::new()).await;
+        eprintln!("{}", trace.pretty());
+        assert_eq!(trace.status, WorkflowStatus::Success);
+        assert_eq!(*calls.lock().unwrap(), 2, "judge ran twice");
+    }
+
+    /// Snapshot loader rejects mismatched schema_version with a
+    /// warning instead of crashing on a struct shape that has since
+    /// changed.
+    #[test]
+    fn snapshot_load_rejects_unknown_schema_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        for version in [2, 99] {
+            let body = serde_json::json!({
+                "schema_version": version,
+                "workflow_id": "x",
+                "inputs": {},
+                "steps": [],
+                "events_count": 0,
+            });
+            std::fs::write(
+                tmp.path().join("workflow-x.json"),
+                serde_json::to_string(&body).unwrap(),
+            )
+            .unwrap();
+            let loaded = WorkflowSnapshot::load(tmp.path(), "x");
+            assert!(
+                loaded.is_none(),
+                "expected None for schema_version {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_load_accepts_current_schema_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = WorkflowSnapshot {
+            schema_version: WorkflowSnapshot::SCHEMA_VERSION,
+            workflow_id: "x".into(),
+            inputs: Map::new(),
+            steps: vec![],
+            events_count: 0,
+        };
+        snap.save(tmp.path()).unwrap();
+        let loaded = WorkflowSnapshot::load(tmp.path(), "x").expect("current version loads");
+        assert_eq!(loaded.workflow_id, "x");
+    }
+
+    struct RetryContextDriver {
+        seen_reuse: std::sync::Mutex<Vec<bool>>,
+        pass_on_attempt: u32,
+    }
+
+    #[async_trait]
+    impl Driver for RetryContextDriver {
+        async fn run(
+            &self,
+            step: &Step,
+            attempt: u32,
+            ctx: &ExecContext<'_>,
+            _lens: Option<&Lens>,
+        ) -> Result<Map<String, Value>, DriverError> {
+            let reuse = ctx
+                .steps
+                .get(&step.id)
+                .is_some_and(|state| state.reuse_gathered_context);
+            self.seen_reuse.lock().unwrap().push(reuse);
+            Ok(Map::from_iter([(
+                "ok".to_string(),
+                Value::Bool(attempt >= self.pass_on_attempt),
+            )]))
+        }
+    }
+
+    fn retry_context_workflow(max_attempts: u32) -> Workflow {
+        parse_workflow(
+            &json!({
+                "$schema_version": 1,
+                "id": "retry-context",
+                "steps": [{
+                    "id": "check",
+                    "agent": "slow",
+                    "prompt": "check",
+                    "outputs": {"ok": {"type": "boolean"}},
+                    "eval": {
+                        "type": "field_check",
+                        "expr": "ok == true",
+                        "on_fail": {
+                            "action": "repeat",
+                            "max_attempts": max_attempts,
+                            "on_exhausted": "exit_failure"
+                        }
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    /// Both re-entry resets re-run a step against the same workspace,
+    /// so the gather it already paid for is still valid. The driver
+    /// drops the cache whenever a step stages real source, so leaving
+    /// this on cannot serve stale bytes.
+    #[test]
+    fn reentry_reuses_the_gather_the_step_already_paid_for() {
+        for (name, reset) in [
+            (
+                "reset_for_reentry",
+                reset_for_reentry as fn(&mut HashMap<String, StepState>, &str),
+            ),
+            (
+                "reset_for_reentry_preserve_outputs",
+                reset_for_reentry_preserve_outputs,
+            ),
+        ] {
+            let mut state = HashMap::from([(
+                "write-commit-message".to_string(),
+                StepState {
+                    id: "write-commit-message".to_string(),
+                    status: StepStatus::Done,
+                    reuse_gathered_context: false,
+                    ..Default::default()
+                },
+            )]);
+            reset(&mut state, "write-commit-message");
+            let st = &state["write-commit-message"];
+            assert_eq!(st.status, StepStatus::Pending, "{name} must reschedule");
+            assert!(
+                st.reuse_gathered_context,
+                "{name} must let the step reuse its own gathered source"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repeat_action_explicitly_enables_same_step_gather_reuse() {
+        let workflow = retry_context_workflow(2);
+        let mut driver = RetryContextDriver {
+            seen_reuse: std::sync::Mutex::new(Vec::new()),
+            pass_on_attempt: 2,
+        };
+
+        let trace = run(&workflow, &mut driver, Map::new()).await;
+
+        assert_eq!(trace.status, WorkflowStatus::Success);
+        assert_eq!(*driver.seen_reuse.lock().unwrap(), vec![false, true]);
+        assert!(!trace.final_state["check"].reuse_gathered_context);
+    }
+
+    #[tokio::test]
+    async fn resume_does_not_reopen_terminally_exhausted_step() {
+        let workflow = retry_context_workflow(1);
+        let snapshots = tempfile::tempdir().unwrap();
+        let mut first = RetryContextDriver {
+            seen_reuse: std::sync::Mutex::new(Vec::new()),
+            pass_on_attempt: 2,
+        };
+        let first_trace = run_with_persistence(
+            &workflow,
+            &mut first,
+            Map::new(),
+            20,
+            snapshots.path().to_path_buf(),
+        )
+        .await;
+        assert!(matches!(first_trace.status, WorkflowStatus::Failure(_)));
+        assert_eq!(
+            first_trace.final_state["check"].status,
+            StepStatus::TerminalFailure
+        );
+
+        let snapshot = WorkflowSnapshot::load(snapshots.path(), &workflow.id).unwrap();
+        let mut resumed = RetryContextDriver {
+            seen_reuse: std::sync::Mutex::new(Vec::new()),
+            pass_on_attempt: 1,
+        };
+        let resumed_trace = run_resume(&workflow, &mut resumed, snapshot, None, 20).await;
+
+        assert!(matches!(resumed_trace.status, WorkflowStatus::Failure(_)));
+        assert!(resumed.seen_reuse.lock().unwrap().is_empty());
+        assert_eq!(resumed_trace.final_state["check"].attempt, 1);
+    }
+
+    /// Fix #10: when a lensed step is killed mid-fan-out, the
+    /// snapshot captures completed lenses. Resume picks up from
+    /// the missing lenses; the already-done ones don't re-run.
+    #[tokio::test]
+    async fn lens_persistence_skips_completed_lenses_on_resume() {
+        use crate::workflow_exec::{run_with_persistence, WorkflowSnapshot};
+        let tmp = tempfile::tempdir().unwrap();
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "lens-persist",
+            "steps": [{
+                "id": "fan",
+                "agent": "fast",
+                "prompt": "p",
+                "lenses": [
+                    {"id": "a"},
+                    {"id": "b"},
+                    {"id": "c"}
+                ],
+                "aggregate": "concat",
+                "outputs": {"findings": {"type": "array<object>"}}
+            }]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+
+        // Driver A: lens 'a' OK, 'b' OK, 'c' errors. Workflow
+        // fails with partial state captured.
+        struct ABFail;
+        #[async_trait]
+        impl Driver for ABFail {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                let id = lens.unwrap().id.clone();
+                if id == "c" {
+                    Err("c blew up".into())
+                } else {
+                    Ok(serde_json::from_value(json!({
+                        "findings": [{"file": format!("{id}.c:1"), "what": id}]
+                    }))
+                    .unwrap())
+                }
+            }
+        }
+        let mut driver = ABFail;
+        let trace =
+            run_with_persistence(&wf, &mut driver, Map::new(), 50, tmp.path().to_path_buf()).await;
+        assert!(matches!(trace.status, WorkflowStatus::Failure(_)));
+
+        let snap = WorkflowSnapshot::load(tmp.path(), "lens-persist").unwrap();
+        let fan_state = snap.steps.iter().find(|s| s.id == "fan").unwrap();
+        // 'a' and 'b' should be saved; 'c' missing.
+        assert!(fan_state.lens_outputs.contains_key("a"));
+        assert!(fan_state.lens_outputs.contains_key("b"));
+        assert!(!fan_state.lens_outputs.contains_key("c"));
+
+        // Driver B: 'c' OK now. Track which lenses driver.run is
+        // called for — should be only 'c'.
+        struct CountCalls {
+            calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl Driver for CountCalls {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                let id = lens.unwrap().id.clone();
+                self.calls.lock().unwrap().push(id.clone());
+                Ok(serde_json::from_value(json!({
+                    "findings": [{"file": format!("{id}.c:1"), "what": id}]
+                }))
+                .unwrap())
+            }
+        }
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut driver2 = CountCalls {
+            calls: calls.clone(),
+        };
+        let _trace2 = run_resume(&wf, &mut driver2, snap, Some(tmp.path().to_path_buf()), 50).await;
+        let called = calls.lock().unwrap().clone();
+        assert_eq!(called, vec!["c".to_string()], "only 'c' should re-run");
+    }
+
+    #[tokio::test]
+    async fn consolidate_retry_clears_saved_lens_outputs() {
+        struct RetryConsolidate {
+            lens_calls: std::sync::Arc<std::sync::Mutex<Vec<(String, u32)>>>,
+            consolidate_calls: std::sync::Arc<std::sync::Mutex<u32>>,
+        }
+
+        #[async_trait]
+        impl Driver for RetryConsolidate {
+            async fn run(
+                &self,
+                _step: &Step,
+                attempt: u32,
+                _ctx: &ExecContext<'_>,
+                lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                let id = lens.expect("lensed step").id.clone();
+                self.lens_calls.lock().unwrap().push((id, attempt));
+                Ok(serde_json::from_value(json!({
+                    "clean": true,
+                    "defects": [],
+                    "analysis": "lens clean",
+                    "correction_step": "write-patch"
+                }))
+                .unwrap())
+            }
+
+            async fn consolidate(
+                &self,
+                _step: &Step,
+                _ctx: &ExecContext<'_>,
+                _per_lens: &[(String, Map<String, Value>)],
+            ) -> Result<Map<String, Value>, DriverError> {
+                let mut calls = self.consolidate_calls.lock().unwrap();
+                *calls += 1;
+                if *calls == 1 {
+                    return Err("inconsistent lens output".into());
+                }
+                Ok(serde_json::from_value(json!({
+                    "clean": true,
+                    "defects": [],
+                    "analysis": "retry clean",
+                    "correction_step": "write-patch"
+                }))
+                .unwrap())
+            }
+        }
+
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "consolidate-retry",
+            "steps": [{
+                "id": "review",
+                "agent": "slow",
+                "prompt": "lens={{lens.id}}",
+                "lenses": [{"id": "a"}, {"id": "b"}],
+                "aggregate": "consolidate",
+                "consolidate": {"prompt": "merge"},
+                "outputs": {
+                    "clean": {"type": "boolean"},
+                    "defects": {"type": "array<object>"},
+                    "analysis": {"type": "string"},
+                    "correction_step": {"type": "string"}
+                },
+                "eval": {
+                    "type": "field_check",
+                    "expr": "clean == true",
+                    "on_fail": {"action": "repeat", "max_attempts": 3}
+                }
+            }]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+        let lens_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let consolidate_calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let mut driver = RetryConsolidate {
+            lens_calls: lens_calls.clone(),
+            consolidate_calls: consolidate_calls.clone(),
+        };
+
+        let trace = run(&wf, &mut driver, Map::new()).await;
+
+        assert_eq!(trace.status, WorkflowStatus::Success);
+        assert_eq!(*consolidate_calls.lock().unwrap(), 2);
+        assert_eq!(
+            lens_calls.lock().unwrap().clone(),
+            vec![
+                ("a".to_string(), 1),
+                ("b".to_string(), 1),
+                ("a".to_string(), 2),
+                ("b".to_string(), 2),
+            ],
+            "consolidate retry must re-run every lens with fresh context"
+        );
+        assert!(trace.final_state["review"].lens_outputs.is_empty());
+    }
+
+    /// run_with_persistence writes a snapshot file; run_resume reads
+    /// it and the second run picks up where the first left off.
+    #[tokio::test]
+    async fn persistence_save_and_resume_roundtrip() {
+        use crate::workflow_exec::{run_resume, run_with_persistence, WorkflowSnapshot};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "persist-test",
+            "steps": [
+                {"id": "first",  "agent": "fast", "prompt": "p",
+                 "outputs": {"v": {"type": "integer"}}},
+                {"id": "second", "agent": "fast", "prompt": "p",
+                 "depends_on": ["first"]}
+            ]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+
+        // Driver A: errors on `second`, so `first` settles but
+        // `second` doesn't and the snapshot captures the partial
+        // state.
+        struct ErrOnSecond;
+        #[async_trait]
+        impl Driver for ErrOnSecond {
+            async fn run(
+                &self,
+                step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                if step.id == "second" {
+                    return Err("simulated outage".into());
+                }
+                Ok(serde_json::from_value(json!({"v": 42})).unwrap())
+            }
+        }
+        let mut driver = ErrOnSecond;
+        let trace =
+            run_with_persistence(&wf, &mut driver, Map::new(), 50, tmp.path().to_path_buf()).await;
+        assert!(matches!(trace.status, WorkflowStatus::Failure(_)));
+
+        // Snapshot exists and shows `first` Done, `second` still Pending.
+        let snap = WorkflowSnapshot::load(tmp.path(), "persist-test").unwrap();
+        let first = snap.steps.iter().find(|s| s.id == "first").unwrap();
+        assert_eq!(first.status, StepStatus::Done);
+        let second = snap.steps.iter().find(|s| s.id == "second").unwrap();
+        assert_eq!(second.status, StepStatus::Pending);
+
+        // Driver B: succeeds on `second`. Resuming picks up there
+        // — `first` is already Done so its driver.run is NOT
+        // called.
+        struct CountFirst {
+            first_calls: std::sync::Arc<std::sync::Mutex<u32>>,
+        }
+        #[async_trait]
+        impl Driver for CountFirst {
+            async fn run(
+                &self,
+                step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                if step.id == "first" {
+                    *self.first_calls.lock().unwrap() += 1;
+                }
+                Ok(serde_json::from_value(json!({"ok": true})).unwrap())
+            }
+        }
+        let first_calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let mut driver2 = CountFirst {
+            first_calls: first_calls.clone(),
+        };
+        let trace2 = run_resume(&wf, &mut driver2, snap, Some(tmp.path().to_path_buf()), 50).await;
+        assert_eq!(trace2.status, WorkflowStatus::Success);
+        assert_eq!(*first_calls.lock().unwrap(), 0, "first must NOT re-run");
+    }
+
+    #[tokio::test]
+    async fn objectives_are_visible_downstream_and_persisted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "objectives-test",
+            "steps": [
+                {"id": "reconcile-review", "agent": "slow", "prompt": "p",
+                 "outputs": {"objectives": {"type": "array<object>"}}},
+                {"id": "write-patch", "agent": "fast", "prompt": "p",
+                 "depends_on": ["reconcile-review"]}
+            ]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+
+        struct ObjectivesDriver {
+            downstream_saw: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
+        }
+
+        #[async_trait]
+        impl Driver for ObjectivesDriver {
+            async fn run(
+                &self,
+                step: &Step,
+                _attempt: u32,
+                ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                if step.id == "write-patch" {
+                    let list = ctx.steps[OBJECTIVES_STEP_ID].outputs["list"].clone();
+                    *self.downstream_saw.lock().unwrap() = Some(list);
+                    return Ok(Map::new());
+                }
+                let mut out = Map::new();
+                out.insert(
+                    "objectives".into(),
+                    json!([{"id": "O1", "statement": "call may_open()", "status": "open"}]),
+                );
+                Ok(out)
+            }
+        }
+
+        let downstream_saw = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut driver = ObjectivesDriver {
+            downstream_saw: downstream_saw.clone(),
+        };
+        let trace =
+            run_with_persistence(&wf, &mut driver, Map::new(), 20, tmp.path().to_path_buf()).await;
+        assert_eq!(trace.status, WorkflowStatus::Success);
+
+        // Rust stamped the age; the step never wrote those fields.
+        let seen = downstream_saw
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("write-patch ran");
+        assert_eq!(seen[0]["id"], json!("O1"));
+        assert_eq!(seen[0]["first_round"], json!(1));
+        assert_eq!(seen[0]["rounds_open"], json!(1));
+
+        // The synthetic step rides the snapshot with the real steps.
+        let snap = WorkflowSnapshot::load(tmp.path(), "objectives-test").unwrap();
+        let stored = snap
+            .steps
+            .iter()
+            .find(|s| s.id == OBJECTIVES_STEP_ID)
+            .expect("objectives state persisted");
+        assert_eq!(stored.outputs["round"], json!(1));
+        assert_eq!(stored.outputs["list"][0]["id"], json!("O1"));
+    }
+
+    /// Workflow.completion.success_when_any short-circuits the run.
+    #[tokio::test]
+    async fn completion_success_expression_short_circuits() {
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "comp-test",
+            "steps": [
+                {"id": "first", "agent": "fast", "prompt": "p",
+                 "outputs": {"flag": {"type": "boolean"}}},
+                {"id": "second", "agent": "fast", "prompt": "p",
+                 "depends_on": ["first"]}
+            ],
+            "completion": {
+                "success_when_any": ["first.flag == true"]
+            }
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+        let mut driver = ScriptedDriver::new().with("first", 1, json!({"flag": true}));
+        let trace = run(&wf, &mut driver, Map::new()).await;
+        match &trace.status {
+            WorkflowStatus::TerminalSuccess(reason) => {
+                assert!(reason.contains("first.flag == true"), "got: {reason}");
+            }
+            other => panic!("expected TerminalSuccess, got {other:?}"),
+        }
+        // Second step never ran.
+        assert!(!trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "second")));
+    }
+
+    #[tokio::test]
+    async fn completion_failure_expression_terminates() {
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "comp-fail",
+            "steps": [
+                {"id": "first", "agent": "fast", "prompt": "p",
+                 "outputs": {"bad": {"type": "boolean"}}},
+                {"id": "second", "agent": "fast", "prompt": "p",
+                 "depends_on": ["first"]}
+            ],
+            "completion": {
+                "failure_when_any": ["first.bad == true"]
+            }
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+        let mut driver = ScriptedDriver::new().with("first", 1, json!({"bad": true}));
+        let trace = run(&wf, &mut driver, Map::new()).await;
+        match &trace.status {
+            WorkflowStatus::Failure(reason) => {
+                assert!(reason.contains("failure_when_any"), "got: {reason}");
+            }
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    /// `aggregate: by_lens` keys every declared output by lens id.
+    #[tokio::test]
+    async fn lens_fan_out_by_lens_aggregation() {
+        // Build a minimal lensed workflow inline.
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "by-lens-test",
+            "steps": [{
+                "id": "scan",
+                "agent": "fast",
+                "prompt": "lens={{lens.id}}",
+                "lenses": [
+                    {"id": "a"},
+                    {"id": "b"}
+                ],
+                "aggregate": "by_lens",
+                "outputs": {
+                    "result": {"type": "string"}
+                }
+            }]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+        let mut driver = ScriptedDriver::new()
+            .with("scan|a", 1, json!({"result": "alpha"}))
+            .with("scan|b", 1, json!({"result": "bravo"}));
+        let trace = run(&wf, &mut driver, Map::new()).await;
+        eprintln!("{}", trace.pretty());
+        assert_eq!(trace.status, WorkflowStatus::Success);
+
+        let agg = trace
+            .events
+            .iter()
+            .find_map(|e| match e {
+                TraceEvent::FanIn { aggregated, .. } => Some(aggregated.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let by = agg.get("result").unwrap().as_object().unwrap();
+        assert_eq!(by.get("a"), Some(&json!("alpha")));
+        assert_eq!(by.get("b"), Some(&json!("bravo")));
+    }
+
+    /// Inputs with target_kind = finding_dir so all branches that
+    /// gate on it (invalidate, publish) are reachable when their
+    /// run_if conditions hold.
+    fn finding_dir_inputs() -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert("target".into(), json!("/tmp/finding"));
+        m.insert("target_kind".into(), json!("finding_dir"));
+        m.insert("target_artifact_dir".into(), json!("/tmp/finding"));
+        m.insert("fix_run_mode".into(), json!("standalone"));
+        m
+    }
+
+    fn prose_inputs() -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert(
+            "target".into(),
+            json!("missing cleanup after synchronous operation"),
+        );
+        m.insert("target_kind".into(), json!("prose"));
+        m.insert("target_artifact_dir".into(), json!(""));
+        m.insert("fix_run_mode".into(), json!("standalone"));
+        m
+    }
+
+    /// Outputs every "successful" research call returns. The patch
+    /// is valid; provenance is handled by fixes-tag-search.
+    fn ok_research() -> Value {
+        json!({
+            "research_status": "confirmed",
+            "valid": true,
+            "invalid_evidence": "",
+            "invalid_evidence_kind": "none",
+            "affected_files": ["drivers/example/example.c"],
+            "affected_symbols": ["example_lookup"],
+            "research_decision": {
+                "bug_proven": true,
+                "fix_contract_proven": true,
+                "invalidity_proven": false,
+                "needs_more_audit": false
+            },
+            "analysis": "Fix example_lookup in drivers/example/example.c."
+        })
+    }
+
+    fn ok_fixes_tag_search() -> Value {
+        json!({
+            "fixes_sha": "abc123def456",
+            "fixes_subject": "subsystem: original buggy commit",
+            "fixes_evidence": "The preimage lacks the bug and the postimage has it.",
+            "unproven_fixes_candidates": [],
+            "analysis": "Checked blame, --follow, pickaxe, and candidate diffs."
+        })
+    }
+
+    fn ok_write_patch() -> Value {
+        json!({
+            "build_target": "drivers/example/example.o",
+            "code_changes_emitted": true,
+            "affected_files_changed": true,
+            "review_dispute": "",
+            "review_dispute_allowed": false
+        })
+    }
+
+    fn ok_header_only_write_patch() -> Value {
+        json!({
+            "build_target": "",
+            "code_changes_emitted": true,
+            "affected_files_changed": true,
+            "review_dispute": "",
+            "review_dispute_allowed": false
+        })
+    }
+
+    fn disputed_review_write_patch() -> Value {
+        json!({
+            "build_target": "",
+            "code_changes_emitted": false,
+            "affected_files_changed": false,
+            "review_dispute": "The review claimed the mismatch path jumps to no_split, but the current patch uses goto out and out calls folio_put(folio2)."
+        })
+    }
+
+    fn ok_commit_message() -> Value {
+        json!({"commit_message_written": true})
+    }
+
+    fn ok_commit() -> Value {
+        json!({"commit_sha": "abc123def4567890"})
+    }
+
+    fn ok_build_clean() -> Value {
+        json!({
+            "result": "clean",
+            "build_target": "drivers/example/example.o",
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": ""
+        })
+    }
+
+    fn ok_empty_build_clean() -> Value {
+        json!({
+            "result": "clean",
+            "build_target": "",
+            "exit_code": 0,
+            "stdout": "no build targets derived; skipping compile",
+            "stderr": ""
+        })
+    }
+
+    fn build_failed() -> Value {
+        json!({
+            "result": "failed",
+            "build_target": "drivers/example/example.o",
+            "exit_code": 2,
+            "stdout": "",
+            "stderr": "drivers/example/example.c:42: error: nope"
+        })
+    }
+
+    fn patch_error_triage() -> Value {
+        json!({"result": "patch_error", "analysis": "ctree.c:42 is caused by the patch"})
+    }
+
+    fn ok_review_clean() -> Value {
+        json!({
+            "clean": true,
+            "defects": [],
+            "analysis": "review clean"
+        })
+    }
+
+    /// One reconciled instruction covering every defect index the
+    /// review reported, which is what `reconcile_covers_every_defect`
+    /// requires.
+    fn ok_reconcile_review(defect_count: usize) -> Value {
+        json!({
+            "instructions": [{
+                "covers": (0..defect_count as i64).collect::<Vec<_>>(),
+                "target": "source",
+                "kind": "behavior",
+                "where": "ctree.c:42",
+                "do": "widen the bound by one",
+                "why": "ctree.c:42 indexes one past the end"
+            }],
+            "contradictions": [],
+            "dropped": [],
+            "analysis": "one instruction covers the reported defects"
+        })
+    }
+
+    fn with_fix_review_attempt(
+        mut driver: ScriptedDriver,
+        wf: &Workflow,
+        attempt: u32,
+        consolidated: Value,
+    ) -> ScriptedDriver {
+        let review = wf.steps.iter().find(|s| s.id == "review").unwrap();
+        let clean_lens = ok_review_clean();
+        for lens in &review.lenses {
+            driver = driver.with(&format!("review|{}", lens.id), attempt, clean_lens.clone());
+        }
+        driver.with("review|@consolidate", attempt, consolidated)
+    }
+
+    /// Regression: shutdown propagates through the AgentEnv-fallback
+    /// path. Earlier version had self.shutdown wired only into the
+    /// orchestrator path; client.messages on the AgentEnv path
+    /// blocked forever on a stuck server. Now every client.messages
+    /// site is wrapped in `tokio::select! { _ = shutdown.cancelled()
+    /// => Err, r = ... }`.
+    #[tokio::test]
+    async fn shutdown_cancels_agentenv_path() {
+        use crate::workflow_runner::{AgentEnv, LlmDriver};
+        use kres_llm::client::Client;
+        use std::sync::Arc;
+
+        // TCP listener that accepts but never replies, so
+        // client.messages would block forever without a guard.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        if sock.read(&mut buf).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "shutdown-test",
+            "steps": [{
+                "id": "stuck",
+                "agent": "fast",
+                "prompt": "p",
+                "outputs": {"x": {"type": "string"}}
+            }]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+
+        let client = Client::builder("test-key")
+            .base_url(format!("http://127.0.0.1:{port}"))
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let env = AgentEnv::new(Arc::new(client), "claude-haiku-4-5-20251001", 4096, None);
+        let shutdown = kres_core::Shutdown::new();
+        let mut driver = LlmDriver::new(std::env::temp_dir(), wf.clone())
+            .with_fast(env)
+            .with_shutdown(shutdown.clone());
+
+        // Cancel after 200ms — without the shutdown guard the test
+        // would hang on client.messages until the 60s timeout.
+        let canceller = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            canceller.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let trace = run(&wf, &mut driver, Map::new()).await;
+        let elapsed = started.elapsed();
+
+        match &trace.status {
+            WorkflowStatus::Failure(msg) => {
+                assert!(
+                    msg.contains("cancelled before LLM call returned"),
+                    "expected shutdown-driven failure, got: {msg}"
+                );
+            }
+            other => panic!("expected Failure from cancelled, got {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "shutdown didn't cancel promptly: took {elapsed:?}"
+        );
+    }
+
+    /// Regression: the optimised lens path must NOT skip eval or
+    /// accepted-effect persistence. Found during a self-review pass — earlier
+    /// version called `continue` after StepProduced and bypassed
+    /// the eval block entirely. A step with eval that fails MUST
+    /// retry (or fail the workflow per its on_fail), not silently
+    /// settle as Done.
+    #[tokio::test]
+    async fn optimised_lens_path_runs_eval() {
+        struct OptimisedDriver {
+            calls: std::sync::Arc<std::sync::Mutex<u32>>,
+        }
+        #[async_trait]
+        impl Driver for OptimisedDriver {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                panic!("per-lens run() must not fire on optimised path")
+            }
+            async fn lens_fan_out_consolidate(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<LensFanOutConsolidate, String> {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                // Pass on the second attempt so the workflow ends
+                // Success after a retry — proves eval ran.
+                let pass = *n >= 2;
+                Ok(LensFanOutConsolidate::Outputs(
+                    serde_json::from_value(json!({"clean": pass})).unwrap(),
+                ))
+            }
+        }
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "opt-eval",
+            "steps": [{
+                "id": "lensed",
+                "agent": "slow",
+                "prompt": "p",
+                "lenses": [{"id": "a"}, {"id": "b"}],
+                "aggregate": "consolidate",
+                "consolidate": {"prompt": "merge"},
+                "outputs": {"clean": {"type": "boolean"}},
+                "eval": {
+                    "type": "field_check",
+                    "expr": "clean == true",
+                    "on_fail": {"action": "repeat", "max_attempts": 3}
+                }
+            }]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let mut driver = OptimisedDriver {
+            calls: calls.clone(),
+        };
+        let trace = run(&wf, &mut driver, Map::new()).await;
+        assert_eq!(trace.status, WorkflowStatus::Success);
+        assert_eq!(*calls.lock().unwrap(), 2, "eval must trigger a retry");
+        // Trace shows EvalFailed on attempt 1 and EvalPassed on
+        // attempt 2.
+        let eval_failed = trace
+            .events
+            .iter()
+            .filter(|e| matches!(e, TraceEvent::EvalFailed { .. }))
+            .count();
+        let eval_passed = trace
+            .events
+            .iter()
+            .filter(|e| matches!(e, TraceEvent::EvalPassed { .. }))
+            .count();
+        assert_eq!(eval_failed, 1);
+        assert_eq!(eval_passed, 1);
+    }
+
+    /// Driver-side output mapping failures, including malformed JSON
+    /// or missing required workflow outputs in the production LLM
+    /// driver, should consume the step's eval retry budget when the
+    /// step has an eval block. This is the control-flow guard that
+    /// lets research recover from bad structured output instead of
+    /// terminating before a second full attempt.
+    #[tokio::test]
+    async fn driver_error_retries_when_step_has_eval_budget() {
+        struct FlakyMappingDriver {
+            calls: std::sync::Arc<std::sync::Mutex<u32>>,
+        }
+
+        #[async_trait]
+        impl Driver for FlakyMappingDriver {
+            async fn run(
+                &self,
+                _step: &Step,
+                attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                *self.calls.lock().unwrap() += 1;
+                if attempt == 1 {
+                    return Err("missing required output(s): research_status".into());
+                }
+                Ok(serde_json::from_value(json!({
+                    "research_status": "confirmed",
+                    "valid": true,
+                    "invalid_evidence": "",
+                    "invalid_evidence_kind": "none"
+                }))
+                .unwrap())
+            }
+        }
+
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "research-retry",
+            "steps": [{
+                "id": "research",
+                "agent": "fast",
+                "prompt": "p",
+                "outputs": {
+                    "research_status": {"type": "string"},
+                    "valid": {"type": "boolean"},
+                    "invalid_evidence": {"type": "string"},
+                    "invalid_evidence_kind": {"type": "string"}
+                },
+                "eval": {
+                    "type": "field_check",
+                    "expr": "research_status == 'confirmed' && valid == true && invalid_evidence == '' && invalid_evidence_kind == 'none'",
+                    "on_fail": {"action": "repeat", "max_attempts": 3}
+                }
+            }]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let mut driver = FlakyMappingDriver {
+            calls: calls.clone(),
+        };
+        let trace = run(&wf, &mut driver, Map::new()).await;
+
+        assert_eq!(trace.status, WorkflowStatus::Success);
+        assert_eq!(*calls.lock().unwrap(), 2);
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::EvalFailed {
+                id,
+                action,
+                eval_failures: 1,
+                ..
+            } if id == "research" && action.contains("driver error")
+        )));
+    }
+
+    #[tokio::test]
+    async fn exhausted_driver_error_is_terminal_across_resume() {
+        struct FailingDriver {
+            calls: std::sync::Arc<std::sync::Mutex<u32>>,
+            fail: bool,
+        }
+
+        #[async_trait]
+        impl Driver for FailingDriver {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                *self.calls.lock().unwrap() += 1;
+                if self.fail {
+                    Err("injected driver failure".into())
+                } else {
+                    Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]))
+                }
+            }
+        }
+
+        let workflow = parse_workflow(
+            &json!({
+                "$schema_version": 1,
+                "id": "driver-exhaustion",
+                "steps": [{
+                    "id": "check",
+                    "agent": "slow",
+                    "prompt": "check",
+                    "outputs": {"ok": {"type": "boolean"}},
+                    "eval": {
+                        "type": "field_check",
+                        "expr": "ok == true",
+                        "on_fail": {
+                            "action": "repeat",
+                            "max_attempts": 2,
+                            "on_exhausted": "exit_failure"
+                        }
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let snapshots = tempfile::tempdir().unwrap();
+        let first_calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let mut first = FailingDriver {
+            calls: first_calls.clone(),
+            fail: true,
+        };
+        let first_trace = run_with_persistence(
+            &workflow,
+            &mut first,
+            Map::new(),
+            20,
+            snapshots.path().to_path_buf(),
+        )
+        .await;
+        assert!(matches!(first_trace.status, WorkflowStatus::Failure(_)));
+        assert_eq!(*first_calls.lock().unwrap(), 2);
+        assert_eq!(
+            first_trace.final_state["check"].status,
+            StepStatus::TerminalFailure
+        );
+
+        let snapshot = WorkflowSnapshot::load(snapshots.path(), &workflow.id).unwrap();
+        let resumed_calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let mut resumed = FailingDriver {
+            calls: resumed_calls.clone(),
+            fail: false,
+        };
+        let resumed_trace = run_resume(&workflow, &mut resumed, snapshot, None, 20).await;
+
+        assert!(matches!(resumed_trace.status, WorkflowStatus::Failure(_)));
+        assert_eq!(*resumed_calls.lock().unwrap(), 0);
+        assert_eq!(resumed_trace.final_state["check"].attempt, 2);
+    }
+
+    /// When the driver overrides `lens_fan_out_consolidate` and
+    /// returns Ok, the executor takes the optimised path: emits
+    /// FanOut → Consolidating → FanIn → StepProduced and skips
+    /// the per-lens loop entirely (no LensProduced events).
+    #[tokio::test]
+    async fn optimised_lens_fan_out_skips_per_lens_loop() {
+        struct OptimisedDriver;
+        #[async_trait]
+        impl Driver for OptimisedDriver {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                panic!("per-lens run() must NOT be called when optimised path is taken")
+            }
+            async fn lens_fan_out_consolidate(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<LensFanOutConsolidate, String> {
+                Ok(LensFanOutConsolidate::Outputs(
+                    serde_json::from_value(json!({"findings": []})).unwrap(),
+                ))
+            }
+        }
+        let wf = lensed_review_workflow();
+        let mut driver = OptimisedDriver;
+        let trace = run(&wf, &mut driver, target_inputs()).await;
+        // Sanity: the workflow finished.
+        assert!(matches!(
+            trace.status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        ));
+        // No LensProduced events — the per-lens loop didn't fire.
+        let lens_produced = trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::LensProduced { .. }));
+        assert!(
+            !lens_produced,
+            "optimised path should skip the per-lens loop"
+        );
+        // FanIn carries strategy=Consolidate.
+        let fan_in = trace.events.iter().find_map(|e| match e {
+            TraceEvent::FanIn { strategy, .. } => Some(strategy.clone()),
+            _ => None,
+        });
+        assert_eq!(fan_in.as_deref(), Some("Consolidate"));
+    }
+
+    /// If a driver advertises the shared-gather lens path and that
+    /// path returns a runtime/schema error, the executor must spend
+    /// the step retry budget. It must not fall back to the per-lens
+    /// loop, because that reintroduces repeated gathering and hides
+    /// the actual shared-path failure.
+    #[tokio::test]
+    async fn optimised_lens_error_retries_instead_of_falling_back() {
+        struct FailingOptimisedDriver {
+            calls: std::sync::Arc<std::sync::Mutex<u32>>,
+        }
+
+        #[async_trait]
+        impl Driver for FailingOptimisedDriver {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                panic!("per-lens run() must not repair shared fan-out failures")
+            }
+
+            async fn lens_fan_out_consolidate(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<LensFanOutConsolidate, String> {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                if *n == 1 {
+                    Err("lens json validation failed".into())
+                } else {
+                    Ok(LensFanOutConsolidate::Outputs(
+                        serde_json::from_value(json!({"clean": true})).unwrap(),
+                    ))
+                }
+            }
+        }
+
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "opt-error-retry",
+            "steps": [{
+                "id": "review",
+                "agent": "slow",
+                "prompt": "p",
+                "lenses": [{"id": "source"}, {"id": "commit"}],
+                "aggregate": "consolidate",
+                "consolidate": {"prompt": "merge"},
+                "outputs": {"clean": {"type": "boolean"}},
+                "eval": {
+                    "type": "field_check",
+                    "expr": "clean == true",
+                    "on_fail": {"action": "repeat", "max_attempts": 3}
+                }
+            }]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let mut driver = FailingOptimisedDriver {
+            calls: calls.clone(),
+        };
+        let trace = run(&wf, &mut driver, Map::new()).await;
+
+        assert_eq!(trace.status, WorkflowStatus::Success);
+        assert_eq!(*calls.lock().unwrap(), 2);
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::EvalFailed {
+                id,
+                action,
+                eval_failures: 1,
+                ..
+            } if id == "review" && action.contains("shared lens fan-out driver error")
+        )));
+        assert!(!trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::LensProduced { .. })));
+    }
+
+    /// When shared-gather lens fan-out is unsupported, the executor
+    /// falls back to the per-lens loop used by ScriptedDriver tests.
+    #[tokio::test]
+    async fn fallback_lens_fan_out_uses_per_lens_loop() {
+        // ScriptedDriver doesn't override lens_fan_out_consolidate,
+        // so the default returns Unsupported and the executor falls
+        // back.
+        let wf = lensed_review_workflow();
+        let mut driver = ScriptedDriver::new()
+            .with("investigate|lifetime", 1, json!({"findings": []}))
+            .with("investigate|memory", 1, json!({"findings": []}))
+            .with("investigate|bounds", 1, json!({"findings": []}))
+            .with("investigate|races", 1, json!({"findings": []}))
+            .with("investigate|general", 1, json!({"findings": []}))
+            .with("investigate|@consolidate", 1, json!({"findings": []}));
+        let trace = run(&wf, &mut driver, target_inputs()).await;
+        assert!(matches!(
+            trace.status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        ));
+        // Per-lens loop fired — LensProduced events present.
+        let lens_count = trace
+            .events
+            .iter()
+            .filter(|e| matches!(e, TraceEvent::LensProduced { .. }))
+            .count();
+        assert_eq!(lens_count, 5);
+    }
+
+    #[tokio::test]
+    async fn observer_streams_events_live() {
+        let wf = fix_workflow();
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_write_patch())
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("build", 1, ok_build_clean())
+            .with("publish", 1, json!({"patch_path": "/tmp/p.diff"}));
+        driver = with_fix_review_attempt(driver, &wf, 1, ok_review_clean());
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let r2 = received.clone();
+        let observer: EventObserver = std::sync::Arc::new(move |ev| {
+            // Tag each event with its kind for the assertion.
+            let tag = match ev {
+                TraceEvent::StepStarted { id, .. } => format!("start:{id}"),
+                TraceEvent::StepProduced { id, .. } => format!("produced:{id}"),
+                TraceEvent::EvalPassed { id, .. } => format!("evalok:{id}"),
+                TraceEvent::Terminated { .. } => "terminated".into(),
+                _ => "other".into(),
+            };
+            r2.lock().unwrap().push(tag);
+        });
+        let _trace = run_with_observer(&wf, &mut driver, finding_dir_inputs(), 200, observer).await;
+        let r = received.lock().unwrap();
+        // The first observed event is start:research (NOT terminated).
+        assert_eq!(
+            r[0], "start:research",
+            "events should arrive live, not all at the end"
+        );
+        assert!(r.contains(&"terminated".into()));
+    }
+
+    #[tokio::test]
+    async fn happy_path_passes_in_one_go() {
+        let wf = fix_workflow();
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_write_patch())
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("build", 1, ok_build_clean())
+            .with("publish", 1, json!({"patch_path": "/tmp/finding/fix.diff"}));
+        driver = with_fix_review_attempt(driver, &wf, 1, ok_review_clean());
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert_eq!(trace.status, WorkflowStatus::Success);
+        // Status update should be skipped for confirmed research.
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::StepSkipped { id, .. } if id == "invalidate"
+        )));
+        // Publish ran exactly once.
+        let publish_runs = trace
+            .events
+            .iter()
+            .filter(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "publish"))
+            .count();
+        assert_eq!(publish_runs, 1);
+        let write_patch_outputs = trace
+            .final_state
+            .get("write-patch")
+            .expect("write-patch state")
+            .outputs
+            .clone();
+        assert_eq!(
+            write_patch_outputs.get("build_target"),
+            Some(&json!("drivers/example/example.o"))
+        );
+        assert!(
+            !write_patch_outputs.contains_key("commit_sha"),
+            "write-patch must not require or carry a model-guessed commit_sha"
+        );
+        // No EvalFailed events.
+        assert!(!trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::EvalFailed { .. })));
+    }
+
+    #[tokio::test]
+    async fn write_patch_allows_non_object_changes_without_build_target() {
+        let wf = fix_workflow();
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_header_only_write_patch())
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("build", 1, ok_empty_build_clean());
+        driver = with_fix_review_attempt(driver, &wf, 1, ok_review_clean());
+
+        let trace = run(&wf, &mut driver, prose_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert!(matches!(
+            trace.status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        ));
+        assert!(!trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::EvalFailed { id, .. } if id == "write-patch"
+        )));
+        assert_eq!(
+            trace.final_state["write-patch"].outputs.get("build_target"),
+            Some(&json!(""))
+        );
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::StepProduced { id, .. } if id == "build"
+        )));
+    }
+
+    /// A deterministic build failure is classified by compile-triage.
+    /// Patch-caused failures branch back to write-patch; the next
+    /// patch attempt can then build clean and proceed to review.
+    /// compile-triage now classifies and the orchestrator routes;
+    /// the path is compile-triage → orchestrator → write-patch.
+    #[tokio::test]
+    async fn compile_triage_patch_error_branches_to_write_patch() {
+        let wf = fix_workflow();
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_write_patch())
+            .with("write-patch", 2, ok_write_patch())
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("write-commit-message", 2, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("commit", 2, ok_commit())
+            .with("build", 1, build_failed())
+            .with("build", 2, ok_build_clean())
+            .with("compile-triage", 1, patch_error_triage())
+            .with(
+                "orchestrator",
+                1,
+                json!({"next_step": "write-patch", "rationale": "fix the build"}),
+            )
+            .with("publish", 1, json!({"patch_path": "/tmp/p.diff"}));
+        driver = with_fix_review_attempt(driver, &wf, 1, ok_review_clean());
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert_eq!(trace.status, WorkflowStatus::Success);
+
+        // compile-triage now classifies and the topo walker hands
+        // off to the orchestrator (review is skipped because build
+        // failed). The orchestrator then routes to write-patch.
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::StepProduced { id, .. } if id == "compile-triage"
+        )));
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::StepSkipped { id, .. } if id == "review"
+        )));
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::BranchedTo { from, to } if from == "orchestrator" && to == "write-patch"
+        )));
+        let write_patch_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "write-patch" => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(write_patch_attempts, vec![1, 2]);
+        let fixes_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "fixes-tag-search" => {
+                    Some(*attempt)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fixes_attempts, vec![1]);
+    }
+
+    /// Source-code review defects branch back to patch writing via
+    /// the orchestrator. The review step reports defects only; the
+    /// orchestrator owns the next-step decision.
+    #[tokio::test]
+    async fn review_defect_branches_to_write_patch() {
+        let wf = fix_workflow();
+        let bad_review = json!({"clean": false, "defects": [{"lens": "bounds",
+                                  "where": "ctree.c:42", "what": "off-by-one"}],
+                                  "analysis": "off-by-one in patched bounds",
+                                  "correction_step": "write-patch"});
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_write_patch())
+            .with("write-patch", 2, ok_write_patch())
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("write-commit-message", 2, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("commit", 2, ok_commit())
+            .with("build", 1, ok_build_clean())
+            .with("build", 2, ok_build_clean())
+            .with("reconcile-review", 1, ok_reconcile_review(1))
+            .with(
+                "orchestrator",
+                1,
+                json!({"next_step": "write-patch", "rationale": "source defect filed"}),
+            )
+            .with("publish", 1, json!({"patch_path": "/tmp/p.diff"}));
+        driver = with_fix_review_attempt(driver, &wf, 1, bad_review.clone());
+        driver = with_fix_review_attempt(driver, &wf, 2, ok_review_clean());
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert_eq!(trace.status, WorkflowStatus::Success);
+
+        let review_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "review" => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(review_attempts, vec![1, 2]);
+        // Routing now flows review → reconcile-review → orchestrator
+        // → write-patch: the lenses are merged into one instruction
+        // set before anything routes on them.
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::BranchedTo { from, to } if from == "review" && to == "reconcile-review"
+        )));
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::BranchedTo { from, to } if from == "orchestrator" && to == "write-patch"
+        )));
+        let fixes_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "fixes-tag-search" => {
+                    Some(*attempt)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fixes_attempts, vec![1]);
+    }
+
+    /// Patch writing can dispute an incorrect source review without
+    /// manufacturing a source edit. The committed patch is unchanged,
+    /// so provenance/commit/build are skipped on the dispute pass and
+    /// the existing review step adjudicates the dispute with preserved
+    /// provenance from the original patch pass.
+    #[tokio::test]
+    async fn write_patch_dispute_routes_back_to_review_without_recommit() {
+        let wf = fix_workflow();
+        let bad_review = json!({
+            "clean": false,
+            "defects": [{
+                "lens": "lifetime",
+                "where": "mm/truncate.c",
+                "what": "mismatch path leaks folio2 if it jumps to no_split"
+            }],
+            "source_defects": [{
+                "lens": "lifetime",
+                "where": "mm/truncate.c",
+                "what": "mismatch path leaks folio2 if it jumps to no_split"
+            }],
+            "commit_message_defects": [],
+            "analysis": "review thinks the mismatch path bypasses folio_put",
+            "correction_step": "write-patch"
+        });
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_write_patch())
+            .with("write-patch", 2, disputed_review_write_patch())
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("build", 1, ok_build_clean())
+            .with(
+                "orchestrator",
+                1,
+                json!({"next_step": "write-patch", "rationale": "source defect filed; let write-patch dispute"}),
+            )
+            .with("publish", 1, json!({"patch_path": "/tmp/p.diff"}));
+        driver = with_fix_review_attempt(driver, &wf, 1, bad_review);
+        driver = with_fix_review_attempt(driver, &wf, 2, ok_review_clean());
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert_eq!(trace.status, WorkflowStatus::Success);
+
+        let attempts = |step_id: &str| -> Vec<u32> {
+            trace
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    TraceEvent::StepStarted { id, attempt } if id == step_id => Some(*attempt),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(attempts("write-patch"), vec![1, 2]);
+        assert_eq!(attempts("review"), vec![1, 2]);
+        assert_eq!(attempts("fixes-tag-search"), vec![1]);
+        assert_eq!(attempts("write-commit-message"), vec![1]);
+        assert_eq!(attempts("commit"), vec![1]);
+        assert_eq!(attempts("build"), vec![1]);
+        assert_eq!(
+            trace.final_state["fixes-tag-search"]
+                .outputs
+                .get("fixes_sha"),
+            Some(&json!("abc123def456")),
+            "no-op review disputes must preserve prior provenance outputs"
+        );
+    }
+
+    /// Commit-message-only review defects must not loop through
+    /// write-patch. They branch directly to write-commit-message so
+    /// the deterministic commit step can amend the existing patch.
+    #[tokio::test]
+    async fn review_commit_message_defect_branches_to_commit_message() {
+        let wf = fix_workflow();
+        let bad_review = json!({
+            "clean": false,
+            "defects": [{
+                "lens": "assertions",
+                "where": "commit message",
+                "what": "message overstates which entry points bypass check_ops_safe"
+            }],
+            "analysis": "code is correct; commit message needs correction",
+            "correction_step": "write-commit-message"
+        });
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_write_patch())
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("write-commit-message", 2, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("commit", 2, ok_commit())
+            .with("build", 1, ok_build_clean())
+            .with("build", 2, ok_build_clean())
+            .with("reconcile-review", 1, json!({
+                "instructions": [{
+                    "covers": [0],
+                    "target": "commit_message",
+                    "where": "commit message, second paragraph",
+                    "do": "name only the entry points that actually bypass check_ops_safe",
+                    "why": "the claim overstates the set"
+                }],
+                "contradictions": [],
+                "dropped": []
+            }))
+            .with(
+                "orchestrator",
+                1,
+                json!({"next_step": "write-commit-message", "rationale": "only the commit message needs fixing"}),
+            )
+            .with("publish", 1, json!({"patch_path": "/tmp/p.diff"}));
+        driver = with_fix_review_attempt(driver, &wf, 1, bad_review);
+        driver = with_fix_review_attempt(driver, &wf, 2, ok_review_clean());
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert_eq!(trace.status, WorkflowStatus::Success);
+
+        // Routing now flows review → reconcile-review → orchestrator
+        // → write-commit-message.
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::BranchedTo { from, to } if from == "review" && to == "reconcile-review"
+        )));
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::BranchedTo { from, to }
+                if from == "orchestrator" && to == "write-commit-message"
+        )));
+
+        let write_patch_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "write-patch" => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(write_patch_attempts, vec![1]);
+
+        let write_commit_message_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "write-commit-message" => {
+                    Some(*attempt)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(write_commit_message_attempts, vec![1, 2]);
+    }
+
+    /// Repeated patch-caused build failures now exhaust the
+    /// orchestrator's routing budget rather than compile-triage's.
+    /// compile-triage classifies; the orchestrator picks write-patch
+    /// each iteration; after max_attempts orchestrator decisions the
+    /// workflow exits Failure.
+    #[tokio::test]
+    async fn compile_triage_exhausts_after_repeated_patch_errors() {
+        let wf = fix_workflow();
+        let pick_write_patch =
+            json!({"next_step": "write-patch", "rationale": "patch still broke the build"});
+        let mut driver = ScriptedDriver::new().with("research", 1, ok_research());
+        for n in 1..=11u32 {
+            driver = driver
+                .with("write-patch", n, ok_write_patch())
+                .with("fixes-tag-search", n, ok_fixes_tag_search())
+                .with("write-commit-message", n, ok_commit_message())
+                .with("commit", n, ok_commit())
+                .with("build", n, build_failed())
+                .with("compile-triage", n, patch_error_triage())
+                .with("orchestrator", n, pick_write_patch.clone());
+        }
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert!(matches!(trace.status, WorkflowStatus::Failure(_)));
+
+        let orchestrator_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "orchestrator" => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(orchestrator_attempts, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert!(trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::Exhausted { id, .. } if id == "orchestrator")));
+    }
+
+    /// The write-patch sanity check fails when the model returns
+    /// neither code changes nor a non-empty dispute. The eval
+    /// Repeats up to 3 times and then exits Failure, so the chain
+    /// never proceeds to commit-fix with an empty diff.
+    #[tokio::test]
+    async fn write_patch_empty_output_routes_to_orchestrator() {
+        // When write-patch's sanity-check eval fails (no edits and no
+        // dispute), the workflow does NOT blind-repeat. It branches
+        // to the orchestrator with the failed attempt visible in
+        // prior_attempts, and the orchestrator decides whether to
+        // retry write-patch with a corrected instruction or exit
+        // failure. This test verifies the routing: the orchestrator
+        // picks exit-failure so the workflow ends cleanly without
+        // running the rest of the chain on an empty patch.
+        let wf = fix_workflow();
+        let empty_write_patch = json!({
+            "build_target": "",
+            "changed_files": [],
+            "code_changes_emitted": false,
+            "affected_files_changed": false,
+            "review_dispute": ""
+        });
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, empty_write_patch)
+            .with(
+                "orchestrator",
+                1,
+                json!({
+                    "next_step": "exit-failure",
+                    "instruction": "",
+                    "rationale": "write-patch produced no edits and no dispute; no instruction would unblock the worker"
+                }),
+            );
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert!(matches!(trace.status, WorkflowStatus::Failure(_)));
+        assert!(
+            trace.events.iter().any(|e| matches!(
+                e,
+                TraceEvent::BranchedTo { from, to } if from == "write-patch" && to == "orchestrator"
+            )),
+            "empty write-patch must branch to orchestrator, not blind-repeat"
+        );
+        let write_patch_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "write-patch" => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            write_patch_attempts,
+            vec![1],
+            "orchestrator owns retry: write-patch must not re-run unless orchestrator routes back to it"
+        );
+        let orchestrator_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "orchestrator" => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(orchestrator_attempts, vec![1]);
+    }
+
+    /// Integration test for the prior_attempts snapshot on cascade
+    /// reset. Cycle 1 produces real build/compile-triage/review
+    /// outputs. Cycle 2's write-patch emits no edits → the cascade
+    /// skips the rest of the chain → orchestrator runs at cycle 2.
+    /// reset_dependents_preserving must have snapshotted cycle-1
+    /// outputs into prior_attempts so the orchestrator's prompt
+    /// (`{{build.prior_attempts}}` etc.) carries the prior verdict.
+    /// Before this snapshot, the cascade cleared everything and the
+    /// orchestrator saw empty signals (regression that exhausted the
+    /// orchestrator cap in the sha256_direct_ctx_not_wiped_on_stack
+    /// run).
+    #[tokio::test]
+    async fn cascade_reset_snapshots_chain_outputs_into_prior_attempts() {
+        let wf = fix_workflow();
+        let empty_write_patch = json!({
+            "build_target": "",
+            "changed_files": [],
+            "code_changes_emitted": false,
+            "affected_files_changed": false,
+            "review_dispute": ""
+        });
+        let preexisting_triage = json!({
+            "result": "preexisting_error",
+            "analysis": "Kconfig fallout, not from the patch"
+        });
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_write_patch())
+            .with("write-patch", 2, empty_write_patch)
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("build", 1, build_failed())
+            .with("compile-triage", 1, preexisting_triage)
+            .with(
+                "orchestrator",
+                1,
+                json!({"next_step": "write-patch", "rationale": "worker should verify worktree"}),
+            )
+            .with(
+                "orchestrator",
+                2,
+                json!({"next_step": "publish", "rationale": "prior_attempts confirm patch is shippable"}),
+            )
+            .with("publish", 1, json!({"patch_path": "/tmp/p.diff"}));
+        driver = with_fix_review_attempt(driver, &wf, 1, ok_review_clean());
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+
+        assert!(matches!(
+            trace.status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        ));
+
+        // Each chain step ran exactly once (cycle 1) and skipped on
+        // cycle 2 — preserved cycle-1 outputs must not have leaked
+        // into live state to re-trigger the run_if expressions.
+        for step_id in [
+            "build",
+            "compile-triage",
+            "review",
+            "write-commit-message",
+            "commit",
+        ] {
+            let attempts: Vec<u32> = trace
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    TraceEvent::StepStarted { id, attempt } if id == step_id => Some(*attempt),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                attempts,
+                vec![1],
+                "{step_id} must run exactly once; the cycle-2 cascade should skip it"
+            );
+        }
+
+        // prior_attempts must carry cycle-1 outputs for the orchestrator
+        // to consult on the next cycle.
+        let build = trace.final_state.get("build").expect("build state");
+        assert_eq!(
+            build.prior_attempts.len(),
+            1,
+            "build prior_attempts must hold cycle-1 outputs after cascade reset"
+        );
+        assert_eq!(
+            build.prior_attempts[0]
+                .get("result")
+                .and_then(Value::as_str),
+            Some("failed"),
+            "build.prior_attempts[0].result must be the cycle-1 value"
+        );
+
+        let triage = trace
+            .final_state
+            .get("compile-triage")
+            .expect("compile-triage state");
+        assert_eq!(triage.prior_attempts.len(), 1);
+        assert_eq!(
+            triage.prior_attempts[0]
+                .get("result")
+                .and_then(Value::as_str),
+            Some("preexisting_error")
+        );
+
+        let review = trace.final_state.get("review").expect("review state");
+        assert_eq!(review.prior_attempts.len(), 1);
+        assert_eq!(
+            review.prior_attempts[0]
+                .get("clean")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    /// The orchestrator can route `next_step: "build"` to re-run the
+    /// build + compile-triage + review chain without re-editing source.
+    /// Use case from the sha256_direct_ctx_not_wiped_on_stack failure:
+    /// after a series of write-patch attempts, the worktree was finally
+    /// correct but the preserved build/compile-triage signals still
+    /// reflected an earlier broken attempt; the orchestrator needed
+    /// a way to refresh them before deciding publish vs exit-failure.
+    #[tokio::test]
+    async fn orchestrator_build_route_reruns_build_chain() {
+        let wf = fix_workflow();
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_write_patch())
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("build", 1, build_failed())
+            .with("compile-triage", 1, patch_error_triage())
+            .with(
+                "orchestrator",
+                1,
+                json!({
+                    "next_step": "build",
+                    "instruction": "",
+                    "rationale": "compile-triage signal looks stale relative to the most recent worktree state; rebuild to refresh"
+                }),
+            )
+            .with("build", 2, ok_build_clean())
+            .with(
+                "orchestrator",
+                2,
+                json!({
+                    "next_step": "publish",
+                    "instruction": "",
+                    "rationale": "rebuild confirms patch is clean"
+                }),
+            )
+            .with("publish", 1, json!({"patch_path": "/tmp/p.diff"}));
+        driver = with_fix_review_attempt(driver, &wf, 1, ok_review_clean());
+        driver = with_fix_review_attempt(driver, &wf, 2, ok_review_clean());
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+
+        // Orchestrator's build verdict must branch back to the build step.
+        assert!(
+            trace.events.iter().any(|e| matches!(
+                e,
+                TraceEvent::BranchedTo { from, to } if from == "orchestrator" && to == "build"
+            )),
+            "next_step=build must branch to the build step"
+        );
+
+        // build must run twice (initial + rebuild).
+        let build_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "build" => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(build_attempts, vec![1, 2]);
+
+        // write-patch must NOT re-run — the `build` route is supposed
+        // to skip source edits entirely.
+        let write_patch_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "write-patch" => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            write_patch_attempts,
+            vec![1],
+            "build route must not re-trigger write-patch"
+        );
+
+        assert!(matches!(
+            trace.status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        ));
+    }
+
+    /// A pre-existing build break (compile-triage classifies
+    /// preexisting_error) reaches the orchestrator with the
+    /// classification visible. Review may also have run on the
+    /// patch's source merits, but the orchestrator is what decides
+    /// whether to publish — it must always be in the loop when the
+    /// build is broken, so it can weigh "patch broke build" vs
+    /// "build broken for unrelated reason" before routing.
+    #[tokio::test]
+    async fn preexisting_build_error_invokes_orchestrator() {
+        let wf = fix_workflow();
+        let preexisting_triage = json!({
+            "result": "preexisting_error",
+            "analysis": "Kconfig fallout, not from the patch"
+        });
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_write_patch())
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("build", 1, build_failed())
+            .with("compile-triage", 1, preexisting_triage)
+            .with(
+                "orchestrator",
+                1,
+                json!({
+                    "next_step": "publish",
+                    "instruction": "",
+                    "rationale": "compile-triage classified the build failure as preexisting_error; the patch itself is independent"
+                }),
+            )
+            .with("publish", 1, json!({"patch_path": "/tmp/p.diff"}));
+        driver = with_fix_review_attempt(driver, &wf, 1, ok_review_clean());
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert!(
+            matches!(
+                trace.status,
+                WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+            ),
+            "preexisting_error must not block the workflow: {:?}",
+            trace.status
+        );
+        // Review still runs on the patch's source merits.
+        assert!(trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "review")));
+        // Orchestrator MUST be in the loop on build failure even
+        // when review is clean, so it can see compile-triage's
+        // classification and decide whether to ship.
+        assert!(trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "orchestrator")));
+        assert!(trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "publish")));
+    }
+
+    /// Orchestrator picks `publish` when the review's residual
+    /// concerns are non-blocking: record-results + publish run via
+    /// the orchestrator-pass clause in their run_if, and the workflow
+    /// terminates Success on publish.completed.
+    #[tokio::test]
+    async fn orchestrator_publish_continues_chain_to_record_results_and_publish() {
+        let wf = fix_workflow();
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_write_patch())
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("build", 1, ok_build_clean())
+            .with(
+                "orchestrator",
+                1,
+                json!({"next_step": "publish", "rationale": "residual review concerns are non-blocking"}),
+            )
+            .with("publish", 1, json!({"patch_path": "/tmp/p.diff"}));
+        driver = with_fix_review_attempt(
+            driver,
+            &wf,
+            1,
+            json!({
+                "clean": false,
+                "defects": [{"lens": "maintainer", "where": "x", "what": "style"}],
+                "analysis": "maintainer aesthetic concern, source is fine",
+                "correction_step": "write-patch"
+            }),
+        );
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert!(
+            matches!(
+                trace.status,
+                WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+            ),
+            "orchestrator publish must finish the workflow: {:?}",
+            trace.status
+        );
+        // Orchestrator ran exactly once; no branch back to write-patch.
+        let orch_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "orchestrator" => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(orch_attempts, vec![1]);
+        assert!(trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "publish")));
+    }
+
+    /// Orchestrator picks `exit-failure`. The completion check's
+    /// failure_when_any expression matches and the workflow exits
+    /// Failure without running record-results or publish.
+    #[tokio::test]
+    async fn orchestrator_exit_failure_terminates_via_completion() {
+        let wf = fix_workflow();
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_write_patch())
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("build", 1, ok_build_clean())
+            .with(
+                "orchestrator",
+                1,
+                json!({"next_step": "exit-failure", "rationale": "no viable route"}),
+            );
+        driver = with_fix_review_attempt(
+            driver,
+            &wf,
+            1,
+            json!({
+                "clean": false,
+                "defects": [{"lens": "lifetime", "where": "x", "what": "real bug"}],
+                "analysis": "cannot converge",
+                "correction_step": "write-patch"
+            }),
+        );
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        match &trace.status {
+            WorkflowStatus::Failure(msg) => assert!(
+                msg.contains("orchestrator.next_step == 'exit-failure'"),
+                "failure should cite the orchestrator's exit-failure verdict: {msg}"
+            ),
+            other => panic!("expected Failure, got {other:?}"),
+        }
+        assert!(!trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "publish")));
+    }
+
+    /// Research declares the bug invalid. The invalidate step has
+    /// terminal_on_success=true, so the workflow ends there;
+    /// write-patch / commit / build / review / publish must NOT run.
+    #[tokio::test]
+    async fn research_invalid_terminal_short_circuit() {
+        let wf = fix_workflow();
+        let invalid_research = json!({
+            "research_status": "invalid",
+            "valid": false,
+            "invalid_evidence": "fs/foo.c:120 already null-checks p",
+            "invalid_evidence_kind": "source_or_commit_evidence",
+            "affected_files": [],
+            "affected_symbols": [],
+            "research_decision": {
+                "bug_proven": false,
+                "fix_contract_proven": false,
+                "invalidity_proven": true,
+                "needs_more_audit": false
+            }
+        });
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, invalid_research)
+            .with(
+                "invalidate",
+                1,
+                json!({"files_updated": ["metadata.yaml", "FINDING.md"]}),
+            );
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert_eq!(
+            trace.status,
+            WorkflowStatus::TerminalSuccess("record-invalidation-results".to_string())
+        );
+
+        // Steps that must NOT have run.
+        for forbidden in [
+            "write-patch",
+            "fixes-tag-search",
+            "write-commit-message",
+            "commit",
+            "build",
+            "compile-triage",
+            "review",
+            "publish",
+        ] {
+            assert!(
+                !trace
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == forbidden)),
+                "step '{forbidden}' should not have run after [INVALID]"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn research_invalid_without_structured_evidence_fails_before_invalidate() {
+        let wf = fix_workflow();
+        let invalid_research = json!({
+            "research_status": "invalid",
+            "valid": false,
+            "invalid_evidence": "",
+            "invalid_evidence_kind": "none",
+            "affected_files": [],
+            "affected_symbols": [],
+            "research_decision": {
+                "bug_proven": false,
+                "fix_contract_proven": false,
+                "invalidity_proven": false,
+                "needs_more_audit": true
+            },
+            "analysis": "Could not prove the finding from gathered context."
+        });
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, invalid_research)
+            .with(
+                "invalidate",
+                1,
+                json!({"files_updated": ["metadata.yaml", "FINDING.md"]}),
+            );
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert!(matches!(trace.status, WorkflowStatus::Failure(_)));
+        assert!(!trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "invalidate")));
+        assert!(!trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "write-patch")));
+    }
+
+    #[tokio::test]
+    async fn research_unconfirmed_with_proven_decision_fails_eval() {
+        let wf = fix_workflow();
+        let contradictory_research = json!({
+            "research_status": "unconfirmed",
+            "valid": false,
+            "invalid_evidence": "",
+            "invalid_evidence_kind": "none",
+            "affected_files": ["mm/memory.c"],
+            "affected_symbols": ["do_swap_page"],
+            "research_decision": {
+                "bug_proven": true,
+                "fix_contract_proven": true,
+                "invalidity_proven": false,
+                "needs_more_audit": false
+            },
+            "analysis": "Confirmed at workspace HEAD but marking unconfirmed."
+        });
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, contradictory_research.clone())
+            .with("research", 2, contradictory_research.clone())
+            .with("research", 3, contradictory_research);
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert!(matches!(trace.status, WorkflowStatus::Failure(_)));
+        assert!(trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::Exhausted { id, .. } if id == "research")));
+        assert!(!trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "unconfirm")));
+        assert!(!trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "write-patch")));
+    }
+
+    #[tokio::test]
+    async fn research_unconfirmed_marks_finding_without_patch() {
+        let wf = fix_workflow();
+        let unconfirmed_research = json!({
+            "research_status": "unconfirmed",
+            "valid": false,
+            "invalid_evidence": "",
+            "invalid_evidence_kind": "none",
+            "affected_files": ["mm/memory.c"],
+            "affected_symbols": ["do_swap_page"],
+            "research_decision": {
+                "bug_proven": false,
+                "fix_contract_proven": false,
+                "invalidity_proven": false,
+                "needs_more_audit": true
+            },
+            "analysis": "Could not prove or disprove the finding from gathered context."
+        });
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, unconfirmed_research)
+            .with(
+                "unconfirm",
+                1,
+                json!({"files_updated": ["metadata.yaml", "FINDING.md"], "status": "unconfirmed"}),
+            );
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert_eq!(
+            trace.status,
+            WorkflowStatus::TerminalSuccess("unconfirm".to_string())
+        );
+        assert!(trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "unconfirm")));
+        assert!(!trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "write-patch")));
+    }
+
+    #[tokio::test]
+    async fn research_with_unmet_followups_does_not_mark_unconfirmed() {
+        let wf = fix_workflow();
+        let incomplete_research = json!({
+            "research_status": "unconfirmed",
+            "valid": false,
+            "invalid_evidence": "",
+            "invalid_evidence_kind": "none",
+            "followups": [{"type": "source", "name": "offline_pages", "reason": "needed to prove the hotplug path"}],
+            "affected_files": ["mm/page_alloc.c"],
+            "affected_symbols": ["zone_pcp_reset"],
+            "research_decision": {
+                "bug_proven": false,
+                "fix_contract_proven": true,
+                "invalidity_proven": false,
+                "needs_more_audit": true
+            },
+            "analysis": "Need the requested source before terminally classifying the finding."
+        });
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, incomplete_research.clone())
+            .with("research", 2, incomplete_research.clone())
+            .with("research", 3, incomplete_research);
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert!(matches!(trace.status, WorkflowStatus::Failure(_)));
+        assert!(trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::Exhausted { id, .. } if id == "research")));
+        // Each eval-fail repeat must push the previous attempt's
+        // outputs into prior_attempts so the next attempt's prompt
+        // can read them via `{{research.prior_attempts}}`. Two
+        // repeats happen here (after attempts 1 and 2); the third
+        // attempt is the exhaustion path and is not pushed.
+        let research_state = trace
+            .final_state
+            .get("research")
+            .expect("research step state present after run");
+        assert_eq!(
+            research_state.prior_attempts.len(),
+            2,
+            "prior_attempts should accumulate one entry per repeat: {:?}",
+            research_state.prior_attempts
+        );
+        for prior in &research_state.prior_attempts {
+            assert_eq!(
+                prior.get("research_status").and_then(Value::as_str),
+                Some("unconfirmed"),
+                "prior attempt should preserve the slow agent's research_status"
+            );
+        }
+        assert!(!trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "unconfirm")));
+        assert!(!trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "write-patch")));
+    }
+
+    #[tokio::test]
+    async fn research_invalid_prose_short_circuits_before_commit() {
+        let wf = fix_workflow();
+        let invalid_research = json!({
+            "research_status": "invalid",
+            "valid": false,
+            "invalid_evidence": "drivers/example/foo.c already releases the reference on completion",
+            "invalid_evidence_kind": "source_or_commit_evidence",
+            "affected_files": [],
+            "affected_symbols": [],
+            "research_decision": {
+                "bug_proven": false,
+                "fix_contract_proven": false,
+                "invalidity_proven": true,
+                "needs_more_audit": false
+            },
+            "analysis": "Not a bug at workspace HEAD."
+        });
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, invalid_research)
+            .default_output(json!({"commit_message_written": true}));
+        let trace = run(&wf, &mut driver, prose_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert!(matches!(trace.status, WorkflowStatus::TerminalSuccess(_)));
+
+        for forbidden in [
+            "write-patch",
+            "fixes-tag-search",
+            "write-commit-message",
+            "commit",
+            "build",
+            "compile-triage",
+            "review",
+            "publish",
+        ] {
+            assert!(
+                !trace
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == forbidden)),
+                "step '{forbidden}' should not have run after invalid prose research"
+            );
+        }
+    }
+
+    // ----- expression evaluator ---------------------------------------
+
+    fn ctx_with(steps: &[(&str, u32, u32, Value)]) -> HashMap<String, StepState> {
+        steps
+            .iter()
+            .map(|(id, attempt, fails, outs)| {
+                let outs = match outs {
+                    Value::Object(m) => m.clone(),
+                    _ => panic!("outputs must be an object"),
+                };
+                (
+                    id.to_string(),
+                    StepState {
+                        id: id.to_string(),
+                        status: StepStatus::Done,
+                        attempt: *attempt,
+                        eval_failures: *fails,
+                        outputs: outs,
+                        ..StepState::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// A missing output field treated as Null must produce `false`
+    /// for BOTH `==` and `!=` comparisons. Without this,
+    /// `research.research_status != 'confirmed'` in
+    /// completion.failure_when_any fires on the per-todo workflow
+    /// before research has even run, terminating it Failure.
+    #[test]
+    fn expr_null_comparisons_return_false_for_eq_and_neq() {
+        let inputs = Map::new();
+        // research is in context with empty outputs — research_status is missing.
+        let states = ctx_with(&[("research", 0, 0, json!({}))]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        // == returns false when the field is missing.
+        assert!(!expr::eval("research.research_status == 'confirmed'", &ctx, None).unwrap());
+        // != ALSO returns false — the field is neither equal nor unequal.
+        assert!(!expr::eval("research.research_status != 'confirmed'", &ctx, None).unwrap());
+    }
+
+    #[test]
+    fn expr_bare_ident_resolves_against_current_step() {
+        let inputs = Map::new();
+        let states = ctx_with(&[("review", 3, 0, json!({"clean": true}))]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        assert!(expr::eval("clean == true", &ctx, Some("review")).unwrap());
+        assert!(!expr::eval("clean == false", &ctx, Some("review")).unwrap());
+    }
+
+    #[test]
+    fn expr_dotted_path_can_walk_current_step_object_output() {
+        let inputs = Map::new();
+        let states = ctx_with(&[(
+            "classify-summary",
+            1,
+            0,
+            json!({"triage_coding": {"schema_version": 1}}),
+        )]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        assert!(expr::eval(
+            "triage_coding.schema_version == 1",
+            &ctx,
+            Some("classify-summary")
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn expr_dotted_path_resolves_named_step() {
+        let inputs = Map::new();
+        let states = ctx_with(&[("research", 1, 0, json!({"valid": true}))]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        assert!(expr::eval("research.valid == true", &ctx, None).unwrap());
+    }
+
+    #[test]
+    fn expr_workflow_input_lookup() {
+        let mut inputs = Map::new();
+        inputs.insert("target_kind".into(), json!("finding_dir"));
+        let states: HashMap<String, StepState> = HashMap::new();
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        assert!(expr::eval("workflow.target_kind == 'finding_dir'", &ctx, None).unwrap());
+    }
+
+    #[test]
+    fn expr_attempt_counter() {
+        let inputs = Map::new();
+        let states = ctx_with(&[("write-patch", 4, 0, json!({}))]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        assert!(!expr::eval("write-patch.attempt <= 3", &ctx, None).unwrap());
+        assert!(expr::eval("write-patch.attempt <= 5", &ctx, None).unwrap());
+    }
+
+    /// A step with no eval block must survive an over-capability
+    /// request and be able to recover from it.
+    ///
+    /// fix.json's lore-search, fixes-tag-search and compile-triage
+    /// declare no eval, so retry_driver_error refused them any budget
+    /// and one oversized followup ended the workflow: a run died on
+    /// `OverInputLimit actual=924140 limit=900000`, of which a single
+    /// patch-bearing git log over a whole file was 3.4 MB.
+    #[tokio::test]
+    async fn a_step_without_an_eval_recovers_from_an_over_limit_request() {
+        let wf = parse_workflow(
+            r#"{"$schema_version":1,"id":"w","steps":[{"id":"searcher","agent":"fast",
+                 "prompt":"p","outputs":{"analysis":{"type":"string"}}}]}"#,
+        )
+        .unwrap();
+
+        /// Refuses once for being too large, then succeeds -- what an
+        /// agent that narrows its request looks like.
+        struct OverLimitThenFits {
+            calls: std::sync::Arc<std::sync::Mutex<u32>>,
+        }
+        #[async_trait]
+        impl Driver for OverLimitThenFits {
+            async fn run(
+                &self,
+                step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                if *n == 1 {
+                    return Err(DriverError::OverInputLimit {
+                        step: step.id.clone(),
+                        actual: 924_140,
+                        limit: 900_000,
+                    });
+                }
+                let mut out = Map::new();
+                out.insert("analysis".into(), Value::String("narrowed".into()));
+                Ok(out)
+            }
+        }
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let mut driver = OverLimitThenFits {
+            calls: calls.clone(),
+        };
+        let trace = run(&wf, &mut driver, Map::new()).await;
+
+        assert!(
+            matches!(trace.status, WorkflowStatus::Success),
+            "the run must survive an over-limit request: {:?}",
+            trace.status
+        );
+        assert_eq!(*calls.lock().unwrap(), 2, "one refusal, one narrowed retry");
+        assert_eq!(
+            trace.final_state["searcher"].outputs["analysis"],
+            Value::String("narrowed".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_is_not_recorded_as_a_rejection_of_the_branching_step() {
+        // `previous_rejection_block` renders `last_eval_reason` as
+        // "Your last response for this step was not accepted: <reason>".
+        // A branch_to eval is how a CORRECT output moves control, so
+        // nothing may be left there for it. See the futex2
+        // `futex_private_hash_put_uaf_mm` run: the orchestrator was
+        // told its own accepted routing was a rejection, decided it had
+        // no worker left, and exited failure on a finished patch.
+        let wf_json = json!({
+            "$schema_version": 1,
+            "id": "branch-reason-wf",
+            "steps": [
+                {
+                    "id": "write-patch",
+                    "agent": "slow",
+                    "prompt": "p",
+                    "outputs": {"done": {"type": "boolean"}}
+                },
+                {
+                    "id": "router",
+                    "agent": "slow",
+                    "prompt": "p",
+                    "depends_on": ["write-patch"],
+                    "outputs": {"next_step": {"type": "string"}},
+                    "eval": {
+                        "type": "builtin",
+                        "name": "orchestrator_dispatch",
+                        "on_fail": {
+                            "action": "branch_to",
+                            "branch_to_output": "next_step",
+                            "max_attempts": 2,
+                            "on_exhausted": "exit_failure"
+                        }
+                    }
+                }
+            ]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+
+        // The router always routes to a worker, so `orchestrator_dispatch`
+        // always returns (false, "route to write-patch") and the branch
+        // is always taken.
+        struct AlwaysRoutes;
+        #[async_trait]
+        impl Driver for AlwaysRoutes {
+            async fn run(
+                &self,
+                step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                let mut m = Map::new();
+                match step.id.as_str() {
+                    "write-patch" => m.insert("done".into(), Value::Bool(true)),
+                    _ => m.insert("next_step".into(), Value::String("write-patch".into())),
+                };
+                Ok(m)
+            }
+        }
+        let mut driver = AlwaysRoutes;
+        let trace = run(&wf, &mut driver, Map::new()).await;
+
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::BranchedTo { from, to } if from == "router" && to == "write-patch"
+        )));
+        let router = trace.final_state.get("router").expect("router state");
+        assert_eq!(
+            router.last_eval_reason, None,
+            "a branch must not leave a rejection for the branching step to read back"
+        );
+        // The branch is still counted, or the routing loop is unbounded.
+        assert!(router.eval_failures > 0);
+    }
+
+    #[tokio::test]
+    async fn a_repeat_still_tells_the_retry_what_was_wrong() {
+        // The complement, on the SAME builtin: `orchestrator_dispatch`
+        // fails two very different ways. A valid routing verb is a
+        // branch and carries no rejection (test above); an unknown one
+        // is a genuine rejection of the output and the retry has to be
+        // told, or it re-makes the same mistake. Losing that was the
+        // 2026-08-08 /validate failure, where eight runs re-made one
+        // omission the eval had named every time.
+        let wf_json = json!({
+            "$schema_version": 1,
+            "id": "repeat-reason-wf",
+            "steps": [{
+                "id": "router",
+                "agent": "slow",
+                "prompt": "p",
+                "outputs": {"next_step": {"type": "string"}},
+                "eval": {
+                    "type": "builtin",
+                    "name": "orchestrator_dispatch",
+                    "on_fail": {"action": "repeat", "max_attempts": 2}
+                }
+            }]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+
+        struct EmitsGarbage;
+        #[async_trait]
+        impl Driver for EmitsGarbage {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                let mut m = Map::new();
+                m.insert("next_step".into(), Value::String("wander-off".into()));
+                Ok(m)
+            }
+        }
+        let mut driver = EmitsGarbage;
+        let trace = run(&wf, &mut driver, Map::new()).await;
+        let router = trace.final_state.get("router").expect("router state");
+        assert!(
+            router
+                .last_eval_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("unknown next_step") && r.contains("wander-off")),
+            "a repeat retry must still be told what failed: {:?}",
+            router.last_eval_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn over_input_limit_never_mutates_prior_attempts() {
+        let wf_json = json!({
+            "$schema_version": 1,
+            "id": "over-limit-wf",
+            "steps": [{
+                "id": "writer",
+                "agent": "slow",
+                "prompt": "p",
+                "outputs": {"analysis": {"type": "string"}}
+            }]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+
+        struct AlwaysOverLimit {
+            calls: std::sync::Arc<std::sync::Mutex<u32>>,
+        }
+        #[async_trait]
+        impl Driver for AlwaysOverLimit {
+            async fn run(
+                &self,
+                step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                let mut c = self.calls.lock().unwrap();
+                *c += 1;
+                Err(DriverError::OverInputLimit {
+                    step: step.id.clone(),
+                    actual: 1000,
+                    limit: 500,
+                })
+            }
+        }
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let mut driver = AlwaysOverLimit {
+            calls: calls.clone(),
+        };
+
+        let seed_with_code_edits = |id: &str| {
+            let mut m = Map::new();
+            m.insert("analysis".into(), Value::String(format!("attempt {id}")));
+            m.insert(
+                "code_edits".into(),
+                json!([{"file_path": "a.c", "old_string": "x", "new_string": "y"}]),
+            );
+            m
+        };
+        let snapshot = WorkflowSnapshot {
+            schema_version: WorkflowSnapshot::SCHEMA_VERSION,
+            workflow_id: "over-limit-wf".into(),
+            inputs: Map::new(),
+            steps: vec![StepState {
+                id: "writer".into(),
+                status: StepStatus::Pending,
+                prior_attempts: vec![seed_with_code_edits("0"), seed_with_code_edits("1")],
+                ..StepState::default()
+            }],
+            events_count: 0,
+        };
+        let trace = crate::workflow_exec::run_resume(&wf, &mut driver, snapshot, None, 50).await;
+
+        // An over-capability request is recoverable: the agent asked
+        // for more evidence than the model can read, and the fix is to
+        // ask for less. The retry is not byte-identical -- the reason
+        // is put in the next attempt's prompt and reuse_gathered_context
+        // is cleared, so it re-gathers rather than replaying the
+        // oversized evidence. This driver refuses regardless, so the
+        // budget is spent and the run still fails; what must not happen
+        // is failing on the first refusal, which killed a whole fix run
+        // over one 3.4 MB git log.
+        assert!(matches!(trace.status, WorkflowStatus::Failure(_)));
+        let final_calls = *calls.lock().unwrap();
+        assert_eq!(
+            final_calls, SELF_CORRECTABLE_DRIVER_ATTEMPTS,
+            "an over-limit step retries within a bounded budget, even with no eval block"
+        );
+        let writer = trace.final_state.get("writer").expect("step state");
+        assert_eq!(writer.status, StepStatus::TerminalFailure);
+        assert!(
+            writer
+                .last_eval_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("token") && r.contains("Nothing was truncated")),
+            "the retry has to be told what overflowed and that nothing was cut: {:?}",
+            writer.last_eval_reason
+        );
+        let st = trace.final_state.get("writer").expect("step state");
+        assert_eq!(st.prior_attempts.len(), 2, "no entries dropped");
+        for (i, entry) in st.prior_attempts.iter().enumerate() {
+            assert!(
+                entry.contains_key("code_edits"),
+                "entry {i} must keep code_edits: {entry:?}"
+            );
+            assert!(
+                entry.contains_key("analysis"),
+                "analysis preserved on entry {i}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unexecutable_research_ends_a_todo_run_without_failing_it() {
+        // In todo mode `research_status != 'confirmed'` is a workflow
+        // failure. `unexecutable` has to escape that clause, or the
+        // series driver sees WorkflowStatus::Failure and cannot tell a
+        // mis-planned todo from a broken run.
+        let wf = fix_workflow();
+        let mut inputs = finding_dir_inputs();
+        inputs.insert("fix_run_mode".into(), json!("todo"));
+        inputs.insert("target_artifact_dir".into(), json!(""));
+
+        let mut driver = ScriptedDriver::new().with(
+            "research",
+            1,
+            json!({
+                "research_status": "unexecutable",
+                "valid": false,
+                "invalid_evidence": "",
+                "invalid_evidence_kind": "none",
+                "unexecutable_requirement": "disallowed_action",
+                "unexecutable_detail": "step 1 of the contract is to build and run a C program",
+                "affected_files": [],
+                "affected_symbols": [],
+                "research_decision": {
+                    "bug_proven": true,
+                    "fix_contract_proven": false,
+                    "invalidity_proven": false,
+                    "needs_more_audit": false
+                },
+                "analysis": "cannot be executed by this step"
+            }),
+        );
+        let trace = run(&wf, &mut driver, inputs).await;
+        assert!(
+            matches!(
+                trace.status,
+                WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+            ),
+            "unexecutable must terminate the item run cleanly, got {:?}",
+            trace.status
+        );
+    }
+
+    #[test]
+    fn unexecutable_research_needs_a_typed_missing_capability() {
+        // The status exists so a todo whose contract the step can never
+        // satisfy stops looking like "not confirmed yet". Without the
+        // typed requirement it is just an unfalsifiable "I give up",
+        // which is the thing it replaces.
+        let step = fix_workflow()
+            .steps
+            .into_iter()
+            .find(|step| step.id == "research")
+            .expect("fix.json has a research step");
+        let base = |extra: Value| -> HashMap<String, StepState> {
+            let mut outs = json!({
+                "research_status": "unexecutable",
+                "valid": false,
+                "invalid_evidence": "",
+                "invalid_evidence_kind": "none",
+                "followups": [],
+                "research_decision": {
+                    "bug_proven": true,
+                    "fix_contract_proven": false,
+                    "invalidity_proven": false,
+                    "needs_more_audit": false
+                }
+            });
+            let (Value::Object(o), Value::Object(e)) = (&mut outs, &extra) else {
+                unreachable!()
+            };
+            for (k, v) in e {
+                o.insert(k.clone(), v.clone());
+            }
+            ctx_with(&[("research", 1, 0, outs)])
+        };
+
+        // Missing entirely.
+        let states = base(json!({}));
+        let inputs = Map::new();
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        let (ok, reason) = eval_fix_research_status(&step, &ctx);
+        assert!(!ok);
+        assert!(reason
+            .unwrap_or_default()
+            .contains("unexecutable_requirement"));
+
+        // Named but with no detail for the human who has to re-plan it.
+        let states = base(json!({"unexecutable_requirement": "disallowed_action",
+                                 "unexecutable_detail": "   "}));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        assert!(!eval_fix_research_status(&step, &ctx).0);
+
+        // Both present: accepted.
+        let states = base(json!({
+            "unexecutable_requirement": "disallowed_action",
+            "unexecutable_detail": "the contract's step 1 is to build and run a C program; \
+                                    this step allows read/source/type/git/grep/callers"
+        }));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        assert!(eval_fix_research_status(&step, &ctx).0);
+
+        // needs_more_audit is the discriminator against `unconfirmed`:
+        // if another gather round could settle it, this is the wrong
+        // status and must be refused.
+        let states = base(json!({
+            "unexecutable_requirement": "disallowed_action",
+            "unexecutable_detail": "needs a compiler",
+            "research_decision": {
+                "bug_proven": true,
+                "fix_contract_proven": false,
+                "invalidity_proven": false,
+                "needs_more_audit": true
+            }
+        }));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        assert!(!eval_fix_research_status(&step, &ctx).0);
+    }
+
+    #[test]
+    fn expr_and_or_precedence() {
+        let inputs = Map::new();
+        let states = ctx_with(&[("s", 1, 0, json!({"a": true, "b": false}))]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        // a == true || a == false && b == true → a==true || (false &&
+        // anything) → true.
+        assert!(expr::eval("a == true || a == false && b == true", &ctx, Some("s")).unwrap());
+        // (a == true || a == false) && b == true → true && false →
+        // false.
+        assert!(!expr::eval("(a == true || a == false) && b == true", &ctx, Some("s")).unwrap());
+    }
+}
